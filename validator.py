@@ -65,6 +65,12 @@ DAY_OVER_DAY_DROP_PCT = 30.0    # падение к вчера
 DAY_OVER_DAY_RISE_PCT = 50.0    # рост к вчера
 EMPTY_FIELDS_PCT = 5.0          # доля записей с пустыми ключевыми полями
 
+# Бренды, для которых проверка rows_inserted vs rows_total не имеет смысла:
+# у их парсеров есть встроенная дедупликация, поэтому inserted ≤ total — by design.
+# Jetour: API дистрибьютера иногда отдаёт одну и ту же машину дважды на стыке
+# страниц пагинации. Парсер делает дедуп по car_id перед UPSERT в Supabase.
+SKIP_ROW_DELTA_CHECK = {"jetour"}
+
 # Ключевые поля, которые не должны быть пустыми
 KEY_FIELDS = ["model", "price_base", "dealer_name"]
 
@@ -129,7 +135,7 @@ def check_parsing_runs(client: Client, today: date) -> list[str]:
 
         inserted = run.get("rows_inserted") or 0
         total = run.get("rows_total") or 0
-        if total > 0:
+        if total > 0 and brand not in SKIP_ROW_DELTA_CHECK:
             diff_pct = abs(inserted - total) / total * 100
             if diff_pct > ROW_INSERT_DELTA_PCT:
                 problems.append(
