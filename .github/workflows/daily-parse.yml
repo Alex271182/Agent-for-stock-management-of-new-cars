@@ -86,9 +86,16 @@ jobs:
   validator:
     name: Run data quality validator
     runs-on: ubuntu-latest
+    # При workflow_dispatch с task=all валидатор ждёт парсеры через needs.
+    # Парсеры не блокируют валидатор (always()), даже если упали — он всё равно
+    # пробежит проверки и сообщит, что не так. При task=validator парсеры не
+    # запускаются вообще, поэтому needs трактуется как "пустая зависимость".
+    needs: parsers
     if: |
-      (github.event_name == 'schedule' && github.event.schedule == '0 5 * * *') ||
-      (github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'validator'))
+      always() && (
+        (github.event_name == 'schedule' && github.event.schedule == '0 5 * * *') ||
+        (github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'validator'))
+      )
     timeout-minutes: 10
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
