@@ -1,0 +1,23 @@
+# Секреты — никогда не коммитить
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Локальные результаты парсеров
+*.csv
+output/
+data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
