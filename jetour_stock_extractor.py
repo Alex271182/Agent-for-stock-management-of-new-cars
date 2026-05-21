@@ -585,11 +585,14 @@ def supabase_log_run_finish(supabase_url, key, run_id, status,
             type(e).__name__, e))
 
 
-def upload_to_supabase(cars, supabase_url, key, batch_size=500):
+def upload_to_supabase(cars, supabase_url, key, batch_size=200):
     """Загружает машины в stock_snapshots батчами через UPSERT.
     UPSERT по PK (snapshot_date, brand, car_id) — повторный запуск в тот же
     день обновляет, а не дублирует записи.
     Возвращает (rows_inserted, error_message_or_None).
+
+    batch_size=200: уменьшено с 500, чтобы избежать statement_timeout
+    Supabase на больших UPSERT (наблюдалось 21.05.2026 — partial 1000/3685).
     """
     snapshot_date = datetime.now().strftime("%Y-%m-%d")
     url = supabase_url.rstrip("/") + "/rest/v1/stock_snapshots"
