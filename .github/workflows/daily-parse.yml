@@ -1,0 +1,114 @@
+name: Daily Stock Parse
+
+# 07:00 МСК = 04:00 UTC — запуск парсеров
+# 08:00 МСК = 05:00 UTC — запуск валидатора
+# Cron на GitHub может задерживаться, поэтому валидатор стартует через час —
+# к этому моменту все парсеры должны были завершиться (или провалиться).
+on:
+  schedule:
+    - cron: '0 4 * * *'   # 07:00 МСК — парсеры
+    - cron: '0 5 * * *'   # 08:00 МСК — валидатор
+  workflow_dispatch:       # ручной запуск (Actions → Run workflow)
+    inputs:
+      task:
+        description: 'Что запустить'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - parsers
+          - validator
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # ПАРСЕРЫ — запускаются по расписанию в 04:00 UTC или вручную
+  # ─────────────────────────────────────────────────────────────────────────
+  parsers:
+    name: Run all parsers
+    runs-on: ubuntu-latest
+    # Запускаем только если: cron на 04:00 UTC ИЛИ ручной запуск с task=all/parsers
+    if: |
+      (github.event_name == 'schedule' && github.event.schedule == '0 4 * * *') ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'parsers'))
+    timeout-minutes: 30
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: playwright install --with-deps chromium
+
+      # Jetour
+      - name: Run Jetour parser
+        id: jetour
+        continue-on-error: true
+        run: python jetour_stock_extractor.py
+
+      # Changan + Uni (один скрипт)
+      - name: Run Changan + Uni parser
+        id: changan_uni
+        continue-on-error: true
+        run: python changan_uni_stock_extractor.py
+
+      # Haval / Geely / Belgee через Playwright
+      - name: Run Perxis (Haval/Geely/Belgee) parser
+        id: perxis
+        continue-on-error: true
+        run: python perxis_playwright_extractor.py
+
+      # Итоговый статус: если ВСЕ упали — пометить шаг как failed,
+      # но не блокировать валидатор (он отдельный job).
+      - name: Summary
+        if: always()
+        run: |
+          echo "Jetour:    ${{ steps.jetour.outcome }}"
+          echo "Changan:   ${{ steps.changan_uni.outcome }}"
+          echo "Perxis:    ${{ steps.perxis.outcome }}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # ВАЛИДАТОР — запускается в 05:00 UTC (час после парсеров) или вручную
+  # ─────────────────────────────────────────────────────────────────────────
+  validator:
+    name: Run data quality validator
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'schedule' && github.event.schedule == '0 5 * * *') ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'validator'))
+    timeout-minutes: 10
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install requests python-dotenv supabase
+
+      - name: Run validator
+        run: python validator.py
