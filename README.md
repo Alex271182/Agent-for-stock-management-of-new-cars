@@ -111,4 +111,4 @@ EOF
 # Запуск
 python jetour_stock_extractor.py
 python validator.py
-```
+``` 
