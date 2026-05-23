@@ -1,13 +1,14 @@
 name: Daily Stock Parse
 
-# 07:00 МСК = 04:00 UTC — запуск парсеров
-# 08:00 МСК = 05:00 UTC — запуск валидатора
-# Cron на GitHub может задерживаться, поэтому валидатор стартует через час —
-# к этому моменту все парсеры должны были завершиться (или провалиться).
+# 04:00 МСК = 01:00 UTC — запуск парсеров
+# 05:00 МСК = 02:00 UTC — запуск валидатора
+# Cron на GitHub может задерживаться на 3-4 часа при высокой нагрузке.
+# Сдвиг на 3 часа раньше относительно желаемых 07:00/08:00 МСК даёт буфер —
+# даже при максимальной задержке данные будут в БД к началу рабочего дня.
 on:
   schedule:
-    - cron: '0 4 * * *'   # 07:00 МСК — парсеры
-    - cron: '0 5 * * *'   # 08:00 МСК — валидатор
+    - cron: '0 1 * * *'   # 04:00 МСК — парсеры
+    - cron: '0 2 * * *'   # 05:00 МСК — валидатор
   workflow_dispatch:       # ручной запуск (Actions → Run workflow)
     inputs:
       task:
@@ -29,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     # Запускаем только если: cron на 04:00 UTC ИЛИ ручной запуск с task=all/parsers
     if: |
-      (github.event_name == 'schedule' && github.event.schedule == '0 4 * * *') ||
+      (github.event_name == 'schedule' && github.event.schedule == '0 1 * * *') ||
       (github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'parsers'))
     timeout-minutes: 30
     env:
@@ -93,7 +94,7 @@ jobs:
     needs: parsers
     if: |
       always() && (
-        (github.event_name == 'schedule' && github.event.schedule == '0 5 * * *') ||
+        (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *') ||
         (github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'validator'))
       )
     timeout-minutes: 10
