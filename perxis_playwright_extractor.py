@@ -250,8 +250,21 @@ async (spaceId) => {
       vin:            d.vin || null,
       sku:            d.sku || null,
       model:          models[d.model?.id]?.name || null,
+      // engine: берём name для совместимости + сырые engineDisplacement/enginePower
+      // для отдельных полей engine_volume / engine_power в БД.
       engine:         engines[d.engine?.id]?.name || null,
-      gearbox:        gearboxes[d.gearbox?.id]?.alternateName || null,
+      // engineDisplacement приходит в см³ (1969). Делим на 1000 → литры.
+      engine_volume:  (engines[d.engine?.id]?.engineDisplacement != null)
+                        ? Math.round(engines[d.engine?.id].engineDisplacement / 100) / 10
+                        : null,
+      engine_power:   engines[d.engine?.id]?.enginePower || null,
+      // gearbox: у Haval/Haval Pro заполнен alternateName ("7DCT"), у Geely/Belgee —
+      // только sku ("7АКП", "АВТОМАТИЧЕСКАЯ") и name (длинное описание).
+      // Приоритет: alternateName → sku → name.
+      gearbox:        gearboxes[d.gearbox?.id]?.alternateName
+                       || gearboxes[d.gearbox?.id]?.sku
+                       || gearboxes[d.gearbox?.id]?.name
+                       || null,
       // drivetrain: у Haval в справочнике заполнен alternateName ("FWD", "AWD"),
       // у Geely/Belgee — только name ("Передний", "Полный"). Берём первое
       // непустое, чтобы покрыть все 3 бренда одной строкой.
@@ -259,7 +272,11 @@ async (spaceId) => {
                        || drivetrains[d.drivetrain?.id]?.name
                        || null,
       exterior:       exteriors[d.exterior?.id]?.name || null,
-      version:        versions[d.version?.id]?.alternateName || null,
+      // version (комплектация): alternateName короче и читабельнее, name длинное.
+      // Fallback нужен, т.к. у некоторых машин Geely/Belgee alternateName может быть пуст.
+      version:        versions[d.version?.id]?.alternateName
+                       || versions[d.version?.id]?.name
+                       || null,
       type:           d.type || null,
       condition:      d.condition || null,
       availability:   d.availability || null,
@@ -342,8 +359,8 @@ def car_to_supabase_row(car, snapshot_date, brand_key):
         "model_alias":        None,
         "complectation":      car.get("version"),
         "complectation_code": None,
-        "engine_volume":      None,
-        "engine_power":       None,
+        "engine_volume":      car.get("engine_volume"),
+        "engine_power":       car.get("engine_power"),
         "transmission_type":  car.get("gearbox"),
         "drive_type":         _normalize_drive_type(car.get("drivetrain")),
         "body_type":          None,
@@ -631,3 +648,5 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+    
