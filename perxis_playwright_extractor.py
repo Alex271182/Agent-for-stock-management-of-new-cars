@@ -144,6 +144,7 @@ async (spaceId) => {
   const ids = {
     model: new Set(), engine: new Set(), drivetrain: new Set(),
     gearbox: new Set(), exterior: new Set(), version: new Set(),
+    package: new Set(),
     dealership: new Set(), city: new Set(), benefit: new Set(),
   };
 
@@ -155,6 +156,7 @@ async (spaceId) => {
     if (d.gearbox?.id) ids.gearbox.add(d.gearbox.id);
     if (d.exterior?.id) ids.exterior.add(d.exterior.id);
     if (d.version?.id) ids.version.add(d.version.id);
+    if (d.package?.id) ids.package.add(d.package.id);
     for (const loc of (d.locations || [])) {
       if (loc.collection_id === 'dealers_dealerships') ids.dealership.add(loc.id);
       if (loc.collection_id === 'dealers_cities') ids.city.add(loc.id);
@@ -175,8 +177,12 @@ async (spaceId) => {
     }
   }
 
-  // Грузим справочники чанками по 100 ID
-  async function fetchRefChunked(collectionId, idSet) {
+  // Грузим справочники чанками по 100 ID.
+  // useFind=true → используем client.find() вместо findPublished(): он возвращает
+  // ВСЕ записи (включая неопубликованные). Нужно для vehicles_versions: у Geely
+  // часть машин (ATLAS и др.) ссылается на черновые записи комплектаций, которые
+  // findPublished не возвращает, а сайт показывает.
+  async function fetchRefChunked(collectionId, idSet, useFind) {
     if (!idSet.size) return {};
     const allIds = [...idSet];
     const chunks = [];
@@ -184,10 +190,11 @@ async (spaceId) => {
       chunks.push(allIds.slice(i, i + 100));
     }
     const map = {};
+    const method = useFind ? 'find' : 'findPublished';
     for (const chunk of chunks) {
       const idList = chunk.map(id => "'" + id + "'").join(',');
       try {
-        const resp = await client.findPublished({
+        const resp = await client[method]({
           spaceId, envId: ENV_ID, collectionId,
           filter: { q: ['id in [' + idList + ']'] },
           options: { options: { limit: 200 } },
@@ -200,14 +207,15 @@ async (spaceId) => {
     return map;
   }
 
-  const [models, engines, drivetrains, gearboxes, exteriors, versions,
+  const [models, engines, drivetrains, gearboxes, exteriors, versions, packages,
          dealerships, cities, benefits] = await Promise.all([
     fetchRefChunked('vehicles_models', ids.model),
     fetchRefChunked('vehicles_engines', ids.engine),
     fetchRefChunked('vehicles_drivetrains', ids.drivetrain),
     fetchRefChunked('vehicles_gearboxes', ids.gearbox),
     fetchRefChunked('vehicles_exteriors', ids.exterior),
-    fetchRefChunked('vehicles_versions', ids.version),
+    fetchRefChunked('vehicles_versions', ids.version, true),  // find — для неопубликованных комплектаций
+    fetchRefChunked('vehicles_packages', ids.package),
     fetchRefChunked('dealers_dealerships', ids.dealership),
     fetchRefChunked('dealers_cities', ids.city),
     fetchRefChunked('vehicles_benefits', ids.benefit),
@@ -272,10 +280,14 @@ async (spaceId) => {
                        || drivetrains[d.drivetrain?.id]?.name
                        || null,
       exterior:       exteriors[d.exterior?.id]?.name || null,
-      // version (комплектация): alternateName короче и читабельнее, name длинное.
-      // Fallback нужен, т.к. у некоторых машин Geely/Belgee alternateName может быть пуст.
+      // version (комплектация): сначала пробуем vehicles_versions, потом
+      // vehicles_packages (для машин Geely без опубликованной version,
+      // у которых короткое название комплектации лежит в package).
+      // Приоритет: version.alternateName → version.name → package.alternateName → package.name.
       version:        versions[d.version?.id]?.alternateName
                        || versions[d.version?.id]?.name
+                       || packages[d.package?.id]?.alternateName
+                       || packages[d.package?.id]?.name
                        || null,
       type:           d.type || null,
       condition:      d.condition || null,
@@ -648,5 +660,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-
-    
