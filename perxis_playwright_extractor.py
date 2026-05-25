@@ -252,7 +252,12 @@ async (spaceId) => {
       model:          models[d.model?.id]?.name || null,
       engine:         engines[d.engine?.id]?.name || null,
       gearbox:        gearboxes[d.gearbox?.id]?.alternateName || null,
-      drivetrain:     drivetrains[d.drivetrain?.id]?.alternateName || null,
+      // drivetrain: у Haval в справочнике заполнен alternateName ("FWD", "AWD"),
+      // у Geely/Belgee — только name ("Передний", "Полный"). Берём первое
+      // непустое, чтобы покрыть все 3 бренда одной строкой.
+      drivetrain:     drivetrains[d.drivetrain?.id]?.alternateName
+                       || drivetrains[d.drivetrain?.id]?.name
+                       || null,
       exterior:       exteriors[d.exterior?.id]?.name || null,
       version:        versions[d.version?.id]?.alternateName || null,
       type:           d.type || null,
@@ -270,7 +275,8 @@ async (spaceId) => {
     });
   }
 
-  return { ok: true, cars: result, total, pages_loaded: Math.ceil(allCars.length / PAGE) };
+  return { ok: true, cars: result, total, pages_loaded: Math.ceil(allCars.length / PAGE),
+           debug_first_raw: cars.length > 0 ? cars[0] : null };
 }
 """
 
@@ -301,6 +307,25 @@ def transliterate_city(name):
 
 
 # ─── SUPABASE ROW ────────────────────────────────────────────────────────────
+def _normalize_drive_type(raw):
+    """
+    Приводит разные форматы привода от 3 брендов к единому виду.
+    Haval отдаёт "Полный", "Полный (ToD)", Geely — "Полный", "Передний",
+    Belgee — "Полный привод", "Передний привод". Унифицируем по корню слова.
+    Возвращает: "Полный" / "Передний" / "Задний" / исходное значение / None.
+    """
+    if not raw:
+        return None
+    s = str(raw).lower()
+    if "полн" in s:
+        return "Полный"
+    if "передн" in s:
+        return "Передний"
+    if "задн" in s:
+        return "Задний"
+    return raw  # ничего не подошло — оставляем как было, не теряем данные
+
+
 def car_to_supabase_row(car, snapshot_date, brand_key):
     return {
         "snapshot_date":      snapshot_date,
@@ -320,7 +345,7 @@ def car_to_supabase_row(car, snapshot_date, brand_key):
         "engine_volume":      None,
         "engine_power":       None,
         "transmission_type":  car.get("gearbox"),
-        "drive_type":         car.get("drivetrain"),
+        "drive_type":         _normalize_drive_type(car.get("drivetrain")),
         "body_type":          None,
         "color":              car.get("exterior"),
         "price_base":         int(car["price"]) if car.get("price") else None,
@@ -472,6 +497,7 @@ def extract_brand_via_browser(brand, browser):
         pages = result.get("pages_loaded", "?")
         print("   ✓ Получено {} машин (total в API: {}, страниц: {})".format(
             len(cars), total, pages))
+
         return cars
 
     except PlaywrightTimeoutError as e:
