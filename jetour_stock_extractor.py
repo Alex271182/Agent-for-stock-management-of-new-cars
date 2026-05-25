@@ -483,10 +483,29 @@ def car_to_supabase_row(car, snapshot_date):
         "model_alias":        model.get("alias") or None,
         "complectation":      complect.get("titleRus") or None,
         "complectation_code": complect.get("mcode") or None,
-        "engine_volume":      _num_or_none(modif.get("volume") or modif.get("displacement")),
-        "engine_power":       _int_or_none(modif.get("power") or modif.get("hp")),
+        # engine_volume / engine_power: в API Jetour лежат внутри modif.engine,
+        # а не на верхнем уровне modif. Старые ключи (volume/power/displacement/hp)
+        # оставлены как fallback на случай, если API в будущем изменится обратно.
+        "engine_volume":      _num_or_none(
+                                  get_nested(modif, "engine", "volume", default=None)
+                                  or modif.get("volume")
+                                  or modif.get("displacement")
+                              ),
+        "engine_power":       _int_or_none(
+                                  get_nested(modif, "engine", "power", default=None)
+                                  or get_nested(modif, "engine", "maxPower", default=None)
+                                  or modif.get("power")
+                                  or modif.get("hp")
+                              ),
         "transmission_type":  transmission.get("type") or None,
-        "drive_type":         modif.get("wheel") or modif.get("drive") or None,
+        # drive_type: в API Jetour поле называется drivetrainStructured (объект с title).
+        # Старые ключи wheel/drive оставлены как fallback.
+        "drive_type":         (
+                                  get_nested(modif, "drivetrainStructured", "title", default=None)
+                                  or modif.get("wheel")
+                                  or modif.get("drive")
+                                  or None
+                              ),
         "body_type":          modif.get("body") or get_nested(car, "body", "title") or None,
         "color":              color.get("titleRus") or color.get("title") or None,
 
