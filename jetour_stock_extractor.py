@@ -409,6 +409,81 @@ def print_stats(cars):
 BRAND_KEY = "jetour"
 
 
+def _normalize_drive_type(raw):
+    """
+    Приводит "Передний (2WD)" / "Полный (4WD)" / "Полный (AWD)" / "Полный (XWD)" к
+    единому виду: "Передний" / "Полный" / "Задний".
+    Согласуется с _normalize_drive_type в perxis_playwright_extractor.py — у всех
+    брендов в БД формат становится одинаковым.
+    """
+    if not raw:
+        return None
+    s = str(raw).lower()
+    if "полн" in s:
+        return "Полный"
+    if "передн" in s:
+        return "Передний"
+    if "задн" in s:
+        return "Задний"
+    return raw  # ничего не подошло — не теряем данные
+
+
+def _normalize_transmission(transmission_obj):
+    """
+    Из объекта transmission Jetour API:
+        {"type":"robot", "title":"7G-DCT 7", "speeds":7, "automatic":true}
+    извлекает человекочитаемое название КПП.
+    Приоритет:
+      1) title (например, "7G-DCT 7", "8AT", "6 DCT") — самое информативное.
+      2) если title пуст — маппинг по type (robot→Робот, akpp→АКПП и т.д.).
+      3) если и type не известен — оставляем type как есть с заглавной буквы
+         (данные не теряем).
+    """
+    if not isinstance(transmission_obj, dict):
+        return None
+    title = transmission_obj.get("title")
+    if title and str(title).strip():
+        return str(title).strip()
+    type_alias = transmission_obj.get("type")
+    if not type_alias:
+        return None
+    alias_map = {
+        "robot": "Робот",
+        "akpp":  "АКПП",
+        "at":    "АКПП",
+        "mt":    "МКПП",
+        "mkpp":  "МКПП",
+        "cvt":   "Вариатор",
+        "dct":   "Робот",
+    }
+    key = str(type_alias).lower().strip()
+    if key in alias_map:
+        return alias_map[key]
+    # Неизвестный алиас — оставляем как есть, но с заглавной буквы
+    return str(type_alias).capitalize()
+
+
+def _extract_body_type(modif, car):
+    """
+    Достаёт человекочитаемое название кузова.
+    В API Jetour body — это объект {"type":"crossover","title":"Кроссовер",...},
+    а не строка. Раньше в БД писалась вся сериализованная структура целиком —
+    это была ошибка. Берём только title.
+    """
+    body_obj = modif.get("body") if isinstance(modif, dict) else None
+    if isinstance(body_obj, dict):
+        title = body_obj.get("title") or body_obj.get("typeTitle")
+        if title and str(title).strip():
+            return str(title).strip()
+    # fallback на car.body.title (на случай других схем ответа API)
+    car_body = car.get("body") if isinstance(car, dict) else None
+    if isinstance(car_body, dict):
+        title = car_body.get("title")
+        if title and str(title).strip():
+            return str(title).strip()
+    return None
+
+
 def car_to_supabase_row(car, snapshot_date):
     """Преобразует JSON-объект машины в строку для таблицы stock_snapshots.
     Поля сопоставлены с CSV-логикой car_to_row, но с типизацией под Postgres.
@@ -497,16 +572,20 @@ def car_to_supabase_row(car, snapshot_date):
                                   or modif.get("power")
                                   or modif.get("hp")
                               ),
-        "transmission_type":  transmission.get("type") or None,
+        "transmission_type":  _normalize_transmission(transmission),
         # drive_type: в API Jetour поле называется drivetrainStructured (объект с title).
-        # Старые ключи wheel/drive оставлены как fallback.
-        "drive_type":         (
+        # Старые ключи wheel/drive оставлены как fallback. К результату применяем
+        # нормализацию, чтобы убрать суффиксы (2WD)/(4WD) и привести к единому формату
+        # с другими брендами.
+        "drive_type":         _normalize_drive_type(
                                   get_nested(modif, "drivetrainStructured", "title", default=None)
                                   or modif.get("wheel")
                                   or modif.get("drive")
                                   or None
                               ),
-        "body_type":          modif.get("body") or get_nested(car, "body", "title") or None,
+        # body_type: в API Jetour это объект {"type":"crossover","title":"Кроссовер",...}.
+        # Берём только title, чтобы в БД не попадала сериализованная структура целиком.
+        "body_type":          _extract_body_type(modif, car),
         "color":              color.get("titleRus") or color.get("title") or None,
 
         # Цены / скидки
@@ -739,3 +818,5 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+    
