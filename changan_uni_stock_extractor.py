@@ -158,59 +158,116 @@ def fetch_dicts(session, brand_settings):
 
 
 # ─── ПОСТРАНИЧНЫЙ СБОР МАШИН ─────────────────────────────────────────────────
-def fetch_cars_for_model(session, brand_settings, model):
-    """Качает весь сток одной модели по всей РФ.
+def _fetch_filtered_page(session, base_url, model_id, page, extra_params):
+    """Один запрос dicts с фильтрами. Возвращает (items, has_more)."""
+    params = {
+        "model_id":  str(model_id),
+        "with_cars": "1",
+        "only_cars": "1",
+        "page":      str(page),
+    }
+    params.update(extra_params)
+    url = base_url + "/api/internal/filter/stock/dicts"
+    data, exc = fetch_with_retry(session, url, params=params)
+    if data is None:
+        return None, False
+    cars_data = data.get("cars_data") or {}
+    items = cars_data.get("items") or []
+    has_more = bool(cars_data.get("load_more_endpoint")) and len(items) > 0
+    return items, has_more
 
-    Стратегия: НЕ передаём city_id. Если API всё равно фильтрует по дефолтному
-    городу (например, по IP) — отловим это позже (по статистике в БД).
+
+def _fetch_all_filtered(session, base_url, model_id, extra_params):
+    """Все машины модели под заданным фильтром (с пагинацией). Возвращает list items."""
+    result = []
+    page = 1
+    while page <= CONFIG["max_pages"]:
+        items, has_more = _fetch_filtered_page(session, base_url, model_id, page, extra_params)
+        if items is None:
+            break
+        if not items:
+            break
+        result.extend(items)
+        if not has_more:
+            break
+        page += 1
+        time.sleep(CONFIG["delay_sec"])
+    return result
+
+
+def fetch_model_dicts(session, base_url, model_id):
+    """Берёт справочники complectations[] и colors[] для конкретной модели."""
+    url = base_url + "/api/internal/filter/stock/dicts"
+    data, exc = fetch_with_retry(session, url, params={"model_id": str(model_id), "with_seo": "1"})
+    if data is None:
+        return [], []
+    fd = data.get("filter_data") or {}
+    return (fd.get("complectations") or []), (fd.get("colors") or [])
+
+
+def fetch_cars_for_model(session, brand_settings, model):
+    """Собирает весь сток модели С КОМПЛЕКТАЦИЕЙ И ЦВЕТОМ.
+
+    Стратегия (без прямого источника compl/color в объекте машины):
+      1. Берём справочники комплектаций и цветов модели.
+      2. Перебор по комплектациям: union всех комплектаций = весь сток модели
+         (проверено на CS35 MAX: каждая машина ровно в одной комплектации).
+         Заодно сразу проставляем complectation. Это ЗАМЕНЯЕТ обычный полный обход.
+      3. Перебор по цветам: собираем только id->цвет, проставляем color.
+    Нагрузка ≈ 2 полных обхода модели (комплектации + цвета), не больше.
     """
     base_url = brand_settings["base_url"]
     model_id = model.get("id")
     model_name = model.get("name") or model.get("title") or "?"
 
-    cars = []
-    page = 1
+    complectations, colors = fetch_model_dicts(session, base_url, model_id)
 
-    while page <= CONFIG["max_pages"]:
-        params = {
-            "model_id":  str(model_id),
-            "with_cars": "1",
-            "only_cars": "1",
-            "page":      str(page),
-        }
-        url = base_url + "/api/internal/filter/stock/dicts"
-
-        try:
-            data, exc = fetch_with_retry(session, url, params=params)
-        except requests.HTTPError as e:
-            print("   ✗ HTTP-ошибка для '{}' стр {}: {}".format(
-                model_name, page, e))
-            break
-
-        if data is None:
-            print("   ✗ Не удалось получить '{}' стр {}: {}".format(
-                model_name, page, exc))
-            break
-
-        cars_data = data.get("cars_data") or {}
-        items = cars_data.get("items") or []
-
-        if not items:
-            break
-
+    # 1. Перебор по комплектациям — даёт все машины + комплектацию
+    cars_by_id = {}        # car_id -> объект машины
+    _compl_seen = {}       # car_id -> имя комплектации (для детекта пересечений)
+    for c in complectations:
+        cid = c.get("id")
+        cname = c.get("name")
+        items = _fetch_all_filtered(session, base_url, model_id, {"complectations[]": str(cid)})
         for car in items:
+            car_id = car.get("id")
+            if car_id is None:
+                continue
+            # Детект пересечения: если машина уже была в другой комплектации — предупреждаем.
+            if car_id in _compl_seen and _compl_seen[car_id] != cname:
+                print("   ⚠ {}: машина {} в двух комплектациях ('{}' и '{}')".format(
+                    model_name, car_id, _compl_seen[car_id], cname))
+            _compl_seen[car_id] = cname
+            car["complectation"] = cname
             car["_model_name"] = model_name
             car["_model_id"]   = model_id
-        cars.extend(items)
-
-        has_more = bool(cars_data.get("load_more_endpoint")) and len(items) > 0
-        if not has_more:
-            break
-
-        page += 1
+            cars_by_id[car_id] = car
         time.sleep(CONFIG["delay_sec"])
 
-    return cars
+    # Фоллбэк: если у модели нет справочника комплектаций (вдруг) —
+    # делаем обычный полный обход, чтобы не потерять машины.
+    if not complectations:
+        items = _fetch_all_filtered(session, base_url, model_id, {})
+        for car in items:
+            car_id = car.get("id")
+            if car_id is None:
+                continue
+            car["_model_name"] = model_name
+            car["_model_id"]   = model_id
+            cars_by_id[car_id] = car
+
+    # 2. Перебор по цветам — только маппинг id -> цвет
+    for col in colors:
+        col_id = col.get("id")
+        col_name = col.get("name")
+        items = _fetch_all_filtered(session, base_url, model_id, {"colors[]": str(col_id)})
+        for car in items:
+            car_id = car.get("id")
+            if car_id in cars_by_id:
+                cars_by_id[car_id]["color"] = col_name
+        time.sleep(CONFIG["delay_sec"])
+
+    return list(cars_by_id.values())
 
 
 def fetch_all_cars(session, brand_settings, models):
