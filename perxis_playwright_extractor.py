@@ -8,7 +8,7 @@ PERXIS Stock Extractor через Playwright (Haval / Haval Pro / Geely / Belgee
 2. На каждом сайте выполняет JS-код, который использует уже загруженный
    на странице Perxis-клиент (window.instockWidget.perxisService._itemsClient)
    для запроса всех машин по всей России (без фильтра по городу)
-3. Получает JSON, нормализует и грузит в Supabase (таблица stock_snapshots)
+3. Получает JSON, нормализует, льёт в stock_staging и вызывает apply_stock_snapshot (stock_cars)
 
 Преимущество перед сырым gRPC-Web на Python:
 - НЕ нужно реверсить protobuf-схему
@@ -144,7 +144,6 @@ async (spaceId) => {
   const ids = {
     model: new Set(), engine: new Set(), drivetrain: new Set(),
     gearbox: new Set(), exterior: new Set(), version: new Set(),
-    package: new Set(),
     dealership: new Set(), city: new Set(), benefit: new Set(),
   };
 
@@ -156,7 +155,6 @@ async (spaceId) => {
     if (d.gearbox?.id) ids.gearbox.add(d.gearbox.id);
     if (d.exterior?.id) ids.exterior.add(d.exterior.id);
     if (d.version?.id) ids.version.add(d.version.id);
-    if (d.package?.id) ids.package.add(d.package.id);
     for (const loc of (d.locations || [])) {
       if (loc.collection_id === 'dealers_dealerships') ids.dealership.add(loc.id);
       if (loc.collection_id === 'dealers_cities') ids.city.add(loc.id);
@@ -177,12 +175,8 @@ async (spaceId) => {
     }
   }
 
-  // Грузим справочники чанками по 100 ID.
-  // useFind=true → используем client.find() вместо findPublished(): он возвращает
-  // ВСЕ записи (включая неопубликованные). Нужно для vehicles_versions: у Geely
-  // часть машин (ATLAS и др.) ссылается на черновые записи комплектаций, которые
-  // findPublished не возвращает, а сайт показывает.
-  async function fetchRefChunked(collectionId, idSet, useFind) {
+  // Грузим справочники чанками по 100 ID
+  async function fetchRefChunked(collectionId, idSet) {
     if (!idSet.size) return {};
     const allIds = [...idSet];
     const chunks = [];
@@ -190,11 +184,10 @@ async (spaceId) => {
       chunks.push(allIds.slice(i, i + 100));
     }
     const map = {};
-    const method = useFind ? 'find' : 'findPublished';
     for (const chunk of chunks) {
       const idList = chunk.map(id => "'" + id + "'").join(',');
       try {
-        const resp = await client[method]({
+        const resp = await client.findPublished({
           spaceId, envId: ENV_ID, collectionId,
           filter: { q: ['id in [' + idList + ']'] },
           options: { options: { limit: 200 } },
@@ -207,15 +200,14 @@ async (spaceId) => {
     return map;
   }
 
-  const [models, engines, drivetrains, gearboxes, exteriors, versions, packages,
+  const [models, engines, drivetrains, gearboxes, exteriors, versions,
          dealerships, cities, benefits] = await Promise.all([
     fetchRefChunked('vehicles_models', ids.model),
     fetchRefChunked('vehicles_engines', ids.engine),
     fetchRefChunked('vehicles_drivetrains', ids.drivetrain),
     fetchRefChunked('vehicles_gearboxes', ids.gearbox),
     fetchRefChunked('vehicles_exteriors', ids.exterior),
-    fetchRefChunked('vehicles_versions', ids.version, true),  // find — для неопубликованных комплектаций
-    fetchRefChunked('vehicles_packages', ids.package),
+    fetchRefChunked('vehicles_versions', ids.version),
     fetchRefChunked('dealers_dealerships', ids.dealership),
     fetchRefChunked('dealers_cities', ids.city),
     fetchRefChunked('vehicles_benefits', ids.benefit),
@@ -258,37 +250,11 @@ async (spaceId) => {
       vin:            d.vin || null,
       sku:            d.sku || null,
       model:          models[d.model?.id]?.name || null,
-      // engine: берём name для совместимости + сырые engineDisplacement/enginePower
-      // для отдельных полей engine_volume / engine_power в БД.
       engine:         engines[d.engine?.id]?.name || null,
-      // engineDisplacement приходит в см³ (1969). Делим на 1000 → литры.
-      engine_volume:  (engines[d.engine?.id]?.engineDisplacement != null)
-                        ? Math.round(engines[d.engine?.id].engineDisplacement / 100) / 10
-                        : null,
-      engine_power:   engines[d.engine?.id]?.enginePower || null,
-      // gearbox: у Haval/Haval Pro заполнен alternateName ("7DCT"), у Geely/Belgee —
-      // только sku ("7АКП", "АВТОМАТИЧЕСКАЯ") и name (длинное описание).
-      // Приоритет: alternateName → sku → name.
-      gearbox:        gearboxes[d.gearbox?.id]?.alternateName
-                       || gearboxes[d.gearbox?.id]?.sku
-                       || gearboxes[d.gearbox?.id]?.name
-                       || null,
-      // drivetrain: у Haval в справочнике заполнен alternateName ("FWD", "AWD"),
-      // у Geely/Belgee — только name ("Передний", "Полный"). Берём первое
-      // непустое, чтобы покрыть все 3 бренда одной строкой.
-      drivetrain:     drivetrains[d.drivetrain?.id]?.alternateName
-                       || drivetrains[d.drivetrain?.id]?.name
-                       || null,
+      gearbox:        gearboxes[d.gearbox?.id]?.alternateName || null,
+      drivetrain:     drivetrains[d.drivetrain?.id]?.alternateName || null,
       exterior:       exteriors[d.exterior?.id]?.name || null,
-      // version (комплектация): сначала пробуем vehicles_versions, потом
-      // vehicles_packages (для машин Geely без опубликованной version,
-      // у которых короткое название комплектации лежит в package).
-      // Приоритет: version.alternateName → version.name → package.alternateName → package.name.
-      version:        versions[d.version?.id]?.alternateName
-                       || versions[d.version?.id]?.name
-                       || packages[d.package?.id]?.alternateName
-                       || packages[d.package?.id]?.name
-                       || null,
+      version:        versions[d.version?.id]?.alternateName || null,
       type:           d.type || null,
       condition:      d.condition || null,
       availability:   d.availability || null,
@@ -304,8 +270,7 @@ async (spaceId) => {
     });
   }
 
-  return { ok: true, cars: result, total, pages_loaded: Math.ceil(allCars.length / PAGE),
-           debug_first_raw: cars.length > 0 ? cars[0] : null };
+  return { ok: true, cars: result, total, pages_loaded: Math.ceil(allCars.length / PAGE) };
 }
 """
 
@@ -336,28 +301,8 @@ def transliterate_city(name):
 
 
 # ─── SUPABASE ROW ────────────────────────────────────────────────────────────
-def _normalize_drive_type(raw):
-    """
-    Приводит разные форматы привода от 3 брендов к единому виду.
-    Haval отдаёт "Полный", "Полный (ToD)", Geely — "Полный", "Передний",
-    Belgee — "Полный привод", "Передний привод". Унифицируем по корню слова.
-    Возвращает: "Полный" / "Передний" / "Задний" / исходное значение / None.
-    """
-    if not raw:
-        return None
-    s = str(raw).lower()
-    if "полн" in s:
-        return "Полный"
-    if "передн" in s:
-        return "Передний"
-    if "задн" in s:
-        return "Задний"
-    return raw  # ничего не подошло — оставляем как было, не теряем данные
-
-
-def car_to_supabase_row(car, snapshot_date, brand_key):
+def car_to_supabase_row(car, brand_key):
     return {
-        "snapshot_date":      snapshot_date,
         "brand":              brand_key,
         "car_id":             str(car.get("car_id") or ""),
         "vin":                car.get("vin"),
@@ -371,10 +316,10 @@ def car_to_supabase_row(car, snapshot_date, brand_key):
         "model_alias":        None,
         "complectation":      car.get("version"),
         "complectation_code": None,
-        "engine_volume":      car.get("engine_volume"),
-        "engine_power":       car.get("engine_power"),
+        "engine_volume":      None,
+        "engine_power":       None,
         "transmission_type":  car.get("gearbox"),
-        "drive_type":         _normalize_drive_type(car.get("drivetrain")),
+        "drive_type":         car.get("drivetrain"),
         "body_type":          None,
         "color":              car.get("exterior"),
         "price_base":         int(car["price"]) if car.get("price") else None,
@@ -397,12 +342,7 @@ def car_to_supabase_row(car, snapshot_date, brand_key):
         "parallel_import":    False,
         "mileage_km":         None,
         "is_used":            car.get("condition") != "excellent" if car.get("condition") else False,
-        "raw_data":           {
-            "perxis_id":     car.get("car_id"),
-            "engine":        car.get("engine"),
-            "max_benefit":   car.get("max_benefit"),  # одна максимальная программа
-            "benefits_total": car.get("benefits_total"),  # сумма всех
-        },
+        "engine":             car.get("engine") or None,
     }
 
 
@@ -453,37 +393,56 @@ def supabase_run_finish(sb_url, key, rid, status, rows_inserted, rows_total,
         pass
 
 
-def upload_to_supabase(rows, sb_url, key, brand_key, batch_size=500):
-    url = sb_url.rstrip("/") + "/rest/v1/stock_snapshots"
+def upload_to_supabase(rows, sb_url, key, brand_key, batch_size=200):
+    """Льёт срез бренда в stock_staging, затем вызывает apply_stock_snapshot(brand_key, date).
+    rows — уже готовые строки (без snapshot_date). Возвращает (result_dict_or_None, err_or_None).
+    """
+    snapshot_date = datetime.now().strftime("%Y-%m-%d")
+    staging_url = sb_url.rstrip("/") + "/rest/v1/stock_staging"
+
+    for row in rows:
+        row["snapshot_date"] = snapshot_date
+
     seen = {}
     for row in rows:
-        pk = (row["snapshot_date"], row["brand"], row["car_id"])
-        seen[pk] = row
+        seen[(row["brand"], row["car_id"])] = row
     dups = len(rows) - len(seen)
     if dups:
         print("   ⚠ Дублей по car_id: {} (удалено)".format(dups))
     rows = list(seen.values())
+
     total = len(rows)
-    inserted = 0
-    print("   Загружаю {} строк батчами по {} ...".format(total, batch_size))
+    print("   [a] Заливаю {} строк в stock_staging батчами по {} ...".format(total, batch_size))
+
+    try:
+        supabase_req("DELETE", staging_url + "?brand=eq." + brand_key, key,
+                     headers={"Prefer": "return=minimal"})
+    except Exception as e:
+        print("   ⚠ Не удалось очистить staging заранее: {}: {}".format(type(e).__name__, e))
+
     for i in range(0, total, batch_size):
         batch = rows[i:i+batch_size]
         try:
             r = supabase_req(
-                "POST", url, key, json=batch,
-                headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
-            )
+                "POST", staging_url, key, json=batch,
+                headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
             if r.status_code in (200, 201, 204):
-                inserted += len(batch)
                 print("      батч {:4d}-{:4d}: OK".format(i+1, i+len(batch)))
             else:
-                err = "HTTP {}: {}".format(r.status_code, r.text[:300])
-                print("      батч {:4d}-{:4d}: FAIL {}".format(i+1, i+len(batch), err))
-                return inserted, err
+                return None, "staging HTTP {}: {}".format(r.status_code, r.text[:300])
         except Exception as e:
-            err = "{}: {}".format(type(e).__name__, e)
-            return inserted, err
-    return inserted, None
+            return None, "{}: {}".format(type(e).__name__, e)
+
+    print("   [b] Вызываю apply_stock_snapshot('{}', '{}') ...".format(brand_key, snapshot_date))
+    rpc_url = sb_url.rstrip("/") + "/rest/v1/rpc/apply_stock_snapshot"
+    try:
+        r = supabase_req("POST", rpc_url, key, json={
+            "p_brand": brand_key, "p_snapshot_date": snapshot_date})
+        if r.status_code not in (200, 201, 204):
+            return None, "rpc HTTP {}: {}".format(r.status_code, r.text[:300])
+        return (r.json() if r.text else {}), None
+    except Exception as e:
+        return None, "rpc {}: {}".format(type(e).__name__, e)
 
 
 # ─── ОСНОВНОЕ ───────────────────────────────────────────────────────────────
@@ -526,7 +485,6 @@ def extract_brand_via_browser(brand, browser):
         pages = result.get("pages_loaded", "?")
         print("   ✓ Получено {} машин (total в API: {}, страниц: {})".format(
             len(cars), total, pages))
-
         return cars
 
     except PlaywrightTimeoutError as e:
@@ -591,21 +549,28 @@ def process_brand(brand, browser, sb_url, sb_key):
 
         if sb_url and sb_key:
             run_id = supabase_run_start(sb_url, sb_key, bucket_brand)
-            rows = [car_to_supabase_row(c, today, bucket_brand) for c in bucket_cars]
+            rows = [car_to_supabase_row(c, bucket_brand) for c in bucket_cars]
             try:
-                inserted, err = upload_to_supabase(rows, sb_url, sb_key, bucket_brand)
+                result, err = upload_to_supabase(rows, sb_url, sb_key, bucket_brand)
                 duration = int(time.time() - started)
                 if err is None:
+                    arrived = result.get("arrived", 0)
+                    updated = result.get("updated", 0)
+                    removed = result.get("removed", 0)
+                    removal_done = result.get("removal_done", True)
+                    note = result.get("note", "")
                     supabase_run_finish(sb_url, sb_key, run_id, "success",
-                                       inserted, len(bucket_cars), duration)
-                    print("   ✓ {}: загружено {}/{} строк".format(
-                        bucket_brand.upper(), inserted, len(bucket_cars)))
+                                       arrived + updated, len(bucket_cars), duration,
+                                       note or None)
+                    print("   ✓ {}: stock_cars — приход {}, обновлено {}, выбытие {}".format(
+                        bucket_brand.upper(), arrived, updated, removed))
+                    if not removal_done:
+                        print("      ⚠ ВЫБЫТИЕ ПРОПУЩЕНО: {}".format(note))
                     results[bucket_brand] = True
                 else:
-                    supabase_run_finish(sb_url, sb_key, run_id,
-                                       "partial" if inserted > 0 else "failed",
-                                       inserted, len(bucket_cars), duration, err)
-                    print("   ⚠ {}: загрузка прервалась: {}".format(bucket_brand.upper(), err))
+                    supabase_run_finish(sb_url, sb_key, run_id, "failed",
+                                       0, len(bucket_cars), duration, err)
+                    print("   ⚠ {}: загрузка не удалась: {}".format(bucket_brand.upper(), err))
                     results[bucket_brand] = False
             except Exception as e:
                 duration = int(time.time() - started)
