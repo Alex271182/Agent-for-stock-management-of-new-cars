@@ -148,27 +148,47 @@ def check_parsing_runs(client: Client, today: date) -> list[str]:
 
 def check_day_over_day(client: Client, today: date) -> list[str]:
     """
-    Проверка 4: сравнение количества записей сегодня vs вчера.
+    Проверка 4: сравнение размера сегодняшнего среза vs вчерашнего.
+
+    Источник: parsing_runs (поле rows_total последнего успешного прогона за день).
+    В новой модели stock_cars нет суточных снимков, поэтому объём среза берём
+    из журнала прогонов — это то же число машин, что парсер видел в этот день.
+    За день может быть несколько прогонов (тесты/повторы) — берём ПОСЛЕДНИЙ
+    по started_at, т.к. он отражает итоговое состояние дня.
+    Логика и пороги (падение >30%, рост >50%) сохранены дословно.
     """
     problems = []
     yesterday = today - timedelta(days=1)
 
-    # Считаем кол-во строк через RPC? Нет — у Supabase Python SDK для count
-    # достаточно select с count='exact', head=True.
-    today_counts: dict[str, int] = {}
-    yest_counts: dict[str, int] = {}
+    def totals_for_day(d: date) -> dict[str, int]:
+        """Сумма rows_total последних прогонов за день по каждому логическому бренду."""
+        day_start = datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc)
+        day_end = datetime.combine(d + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+        resp = (client.table("parsing_runs")
+                .select("brand, rows_total, started_at, status")
+                .gte("started_at", day_start.isoformat())
+                .lt("started_at", day_end.isoformat())
+                .execute())
+        runs = resp.data or []
 
-    for d, bucket in [(today, today_counts), (yesterday, yest_counts)]:
+        # последний прогон за день по каждому brand-алиасу
+        latest: dict[str, dict] = {}
+        for run in runs:
+            b = run["brand"]
+            if b not in latest or run["started_at"] > latest[b]["started_at"]:
+                latest[b] = run
+
+        bucket: dict[str, int] = {}
         for logical_name, aliases in EXPECTED_BRANDS.items():
             total = 0
             for alias in aliases:
-                resp = (client.table("stock_snapshots")
-                        .select("car_id", count="exact", head=True)
-                        .eq("snapshot_date", d.isoformat())
-                        .eq("brand", alias)
-                        .execute())
-                total += resp.count or 0
+                if alias in latest:
+                    total += latest[alias].get("rows_total") or 0
             bucket[logical_name] = total
+        return bucket
+
+    today_counts = totals_for_day(today)
+    yest_counts = totals_for_day(yesterday)
 
     for brand in EXPECTED_BRANDS:
         t = today_counts[brand]
@@ -191,6 +211,10 @@ def check_day_over_day(client: Client, today: date) -> list[str]:
 def check_empty_fields(client: Client, today: date) -> list[str]:
     """
     Проверка 5: доля записей с пустыми ключевыми полями.
+
+    Источник: stock_cars, активные машины (is_active=true) — это актуальный
+    сток на сегодня, прямой аналог "snapshot_date=today" в старой модели.
+    Логика (хотя бы одно ключевое поле NULL) и порог (>5%) сохранены дословно.
     """
     problems = []
 
@@ -198,19 +222,19 @@ def check_empty_fields(client: Client, today: date) -> list[str]:
         total_today = 0
         empty_count = 0
         for alias in aliases:
-            # Общее число записей сегодня
-            total_resp = (client.table("stock_snapshots")
+            # Общее число активных записей бренда
+            total_resp = (client.table("stock_cars")
                           .select("car_id", count="exact", head=True)
-                          .eq("snapshot_date", today.isoformat())
+                          .eq("is_active", True)
                           .eq("brand", alias)
                           .execute())
             total_today += total_resp.count or 0
 
             # Записи с пустыми ключевыми полями (хотя бы одно поле NULL)
             for field in KEY_FIELDS:
-                empty_resp = (client.table("stock_snapshots")
+                empty_resp = (client.table("stock_cars")
                               .select("car_id", count="exact", head=True)
-                              .eq("snapshot_date", today.isoformat())
+                              .eq("is_active", True)
                               .eq("brand", alias)
                               .is_(field, "null")
                               .execute())
