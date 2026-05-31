@@ -115,9 +115,20 @@ def run_finish(rid, status, rows_inserted, rows_total, duration_sec, error_messa
 
 def upsert_daily(rows, batch_size=500):
     inserted = 0
+    # Дедуп по ключу UNIQUE: Postgres не даёт дважды затронуть одну строку
+    # в одной UPSERT-команде. Оставляем последнее вхождение.
+    seen = {}
+    for row in rows:
+        seen[(row["brand"], row["model_name"], row["suffix"], row["search_date"])] = row
+    rows = list(seen.values())
+    # on_conflict обязателен: у таблицы два уникальных ограничения (PK id и
+    # UNIQUE brand+model_name+suffix+search_date). Без явного on_conflict
+    # PostgREST не активирует merge-duplicates по нужному ключу и падает с 409
+    # на повторных днях (WordStat отдаёт историю за 19 дней, часть уже в БД).
+    url = "/rest/v1/wordstat_daily?on_conflict=brand,model_name,suffix,search_date"
     for i in range(0, len(rows), batch_size):
         batch = rows[i:i + batch_size]
-        r = sb_req("POST", "/rest/v1/wordstat_daily", json=batch,
+        r = sb_req("POST", url, json=batch,
                    headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
         if r.status_code in (200, 201, 204):
             inserted += len(batch)
