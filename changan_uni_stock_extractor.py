@@ -8,7 +8,7 @@ CHANGAN + UNI MOTORS RF Stock Extractor  (v1)
 2. Постранично собирает ВСЕ автомобили со ВСЕЙ РФ (без фильтра по городу)
 3. Сохраняет CSV (для подстраховки и Excel)
 4. Если есть .env с SUPABASE_URL и SUPABASE_SERVICE_ROLE_KEY —
-   дополнительно загружает данные в таблицу stock_snapshots и логирует
+   дополнительно заливает срез в stock_staging и вызывает apply_stock_snapshot и логирует
    запуск в parsing_runs.
 
 Поддерживаемые бренды (выбирается через CONFIG):
@@ -158,116 +158,59 @@ def fetch_dicts(session, brand_settings):
 
 
 # ─── ПОСТРАНИЧНЫЙ СБОР МАШИН ─────────────────────────────────────────────────
-def _fetch_filtered_page(session, base_url, model_id, page, extra_params):
-    """Один запрос dicts с фильтрами. Возвращает (items, has_more)."""
-    params = {
-        "model_id":  str(model_id),
-        "with_cars": "1",
-        "only_cars": "1",
-        "page":      str(page),
-    }
-    params.update(extra_params)
-    url = base_url + "/api/internal/filter/stock/dicts"
-    data, exc = fetch_with_retry(session, url, params=params)
-    if data is None:
-        return None, False
-    cars_data = data.get("cars_data") or {}
-    items = cars_data.get("items") or []
-    has_more = bool(cars_data.get("load_more_endpoint")) and len(items) > 0
-    return items, has_more
-
-
-def _fetch_all_filtered(session, base_url, model_id, extra_params):
-    """Все машины модели под заданным фильтром (с пагинацией). Возвращает list items."""
-    result = []
-    page = 1
-    while page <= CONFIG["max_pages"]:
-        items, has_more = _fetch_filtered_page(session, base_url, model_id, page, extra_params)
-        if items is None:
-            break
-        if not items:
-            break
-        result.extend(items)
-        if not has_more:
-            break
-        page += 1
-        time.sleep(CONFIG["delay_sec"])
-    return result
-
-
-def fetch_model_dicts(session, base_url, model_id):
-    """Берёт справочники complectations[] и colors[] для конкретной модели."""
-    url = base_url + "/api/internal/filter/stock/dicts"
-    data, exc = fetch_with_retry(session, url, params={"model_id": str(model_id), "with_seo": "1"})
-    if data is None:
-        return [], []
-    fd = data.get("filter_data") or {}
-    return (fd.get("complectations") or []), (fd.get("colors") or [])
-
-
 def fetch_cars_for_model(session, brand_settings, model):
-    """Собирает весь сток модели С КОМПЛЕКТАЦИЕЙ И ЦВЕТОМ.
+    """Качает весь сток одной модели по всей РФ.
 
-    Стратегия (без прямого источника compl/color в объекте машины):
-      1. Берём справочники комплектаций и цветов модели.
-      2. Перебор по комплектациям: union всех комплектаций = весь сток модели
-         (проверено на CS35 MAX: каждая машина ровно в одной комплектации).
-         Заодно сразу проставляем complectation. Это ЗАМЕНЯЕТ обычный полный обход.
-      3. Перебор по цветам: собираем только id->цвет, проставляем color.
-    Нагрузка ≈ 2 полных обхода модели (комплектации + цвета), не больше.
+    Стратегия: НЕ передаём city_id. Если API всё равно фильтрует по дефолтному
+    городу (например, по IP) — отловим это позже (по статистике в БД).
     """
     base_url = brand_settings["base_url"]
     model_id = model.get("id")
     model_name = model.get("name") or model.get("title") or "?"
 
-    complectations, colors = fetch_model_dicts(session, base_url, model_id)
+    cars = []
+    page = 1
 
-    # 1. Перебор по комплектациям — даёт все машины + комплектацию
-    cars_by_id = {}        # car_id -> объект машины
-    _compl_seen = {}       # car_id -> имя комплектации (для детекта пересечений)
-    for c in complectations:
-        cid = c.get("id")
-        cname = c.get("name")
-        items = _fetch_all_filtered(session, base_url, model_id, {"complectations[]": str(cid)})
+    while page <= CONFIG["max_pages"]:
+        params = {
+            "model_id":  str(model_id),
+            "with_cars": "1",
+            "only_cars": "1",
+            "page":      str(page),
+        }
+        url = base_url + "/api/internal/filter/stock/dicts"
+
+        try:
+            data, exc = fetch_with_retry(session, url, params=params)
+        except requests.HTTPError as e:
+            print("   ✗ HTTP-ошибка для '{}' стр {}: {}".format(
+                model_name, page, e))
+            break
+
+        if data is None:
+            print("   ✗ Не удалось получить '{}' стр {}: {}".format(
+                model_name, page, exc))
+            break
+
+        cars_data = data.get("cars_data") or {}
+        items = cars_data.get("items") or []
+
+        if not items:
+            break
+
         for car in items:
-            car_id = car.get("id")
-            if car_id is None:
-                continue
-            # Детект пересечения: если машина уже была в другой комплектации — предупреждаем.
-            if car_id in _compl_seen and _compl_seen[car_id] != cname:
-                print("   ⚠ {}: машина {} в двух комплектациях ('{}' и '{}')".format(
-                    model_name, car_id, _compl_seen[car_id], cname))
-            _compl_seen[car_id] = cname
-            car["complectation"] = cname
             car["_model_name"] = model_name
             car["_model_id"]   = model_id
-            cars_by_id[car_id] = car
+        cars.extend(items)
+
+        has_more = bool(cars_data.get("load_more_endpoint")) and len(items) > 0
+        if not has_more:
+            break
+
+        page += 1
         time.sleep(CONFIG["delay_sec"])
 
-    # Фоллбэк: если у модели нет справочника комплектаций (вдруг) —
-    # делаем обычный полный обход, чтобы не потерять машины.
-    if not complectations:
-        items = _fetch_all_filtered(session, base_url, model_id, {})
-        for car in items:
-            car_id = car.get("id")
-            if car_id is None:
-                continue
-            car["_model_name"] = model_name
-            car["_model_id"]   = model_id
-            cars_by_id[car_id] = car
-
-    # 2. Перебор по цветам — только маппинг id -> цвет
-    for col in colors:
-        col_id = col.get("id")
-        col_name = col.get("name")
-        items = _fetch_all_filtered(session, base_url, model_id, {"colors[]": str(col_id)})
-        for car in items:
-            car_id = car.get("id")
-            if car_id in cars_by_id:
-                cars_by_id[car_id]["color"] = col_name
-        time.sleep(CONFIG["delay_sec"])
-
-    return list(cars_by_id.values())
+    return cars
 
 
 def fetch_all_cars(session, brand_settings, models):
@@ -444,8 +387,8 @@ def transliterate_city(city_name):
     return alias.strip("-")
 
 
-def car_to_supabase_row(car, snapshot_date, brand_key):
-    """Преобразует JSON-машину Changan/Uni в строку stock_snapshots."""
+def car_to_supabase_row(car, brand_key):
+    """Преобразует JSON-машину Changan/Uni в строку stock_staging (без даты и raw_data)."""
     salon = car.get("salon") or {}
     prices = car.get("prices") or {}
 
@@ -476,8 +419,6 @@ def car_to_supabase_row(car, snapshot_date, brand_key):
             return None
 
     return {
-        # PK
-        "snapshot_date":      snapshot_date,
         "brand":              brand_key,
         "car_id":             str(car.get("id", "")),
 
@@ -527,9 +468,6 @@ def car_to_supabase_row(car, snapshot_date, brand_key):
         "parallel_import":    False,
         "mileage_km":         _int(car.get("mileage")),
         "is_used":            False,
-
-        # Сырой JSON
-        "raw_data":           car,
     }
 
 
@@ -592,49 +530,59 @@ def supabase_log_run_finish(supabase_url, key, run_id, status,
             type(e).__name__, e))
 
 
-def upload_to_supabase(cars, supabase_url, key, brand_key,
-                      batch_size=500):
+def upload_to_supabase(cars, supabase_url, key, brand_key, batch_size=200):
+    """Льёт срез бренда в stock_staging, затем вызывает apply_stock_snapshot(brand_key, date).
+    Возвращает (result_dict_or_None, error_message_or_None).
+    """
     snapshot_date = datetime.now().strftime("%Y-%m-%d")
-    url = supabase_url.rstrip("/") + "/rest/v1/stock_snapshots"
+    staging_url = supabase_url.rstrip("/") + "/rest/v1/stock_staging"
 
-    rows = [car_to_supabase_row(c, snapshot_date, brand_key) for c in cars]
+    rows = [car_to_supabase_row(c, brand_key) for c in cars]
+    for row in rows:
+        row["snapshot_date"] = snapshot_date
 
-    # Дедупликация по PK
+    # Дедуп по (brand, car_id)
     seen = {}
     for row in rows:
-        pk = (row["snapshot_date"], row["brand"], row["car_id"])
-        seen[pk] = row
+        seen[(row["brand"], row["car_id"])] = row
     deduped = len(rows) - len(seen)
     if deduped:
         print("   ⚠ Дублей по car_id: {} (удалено)".format(deduped))
     rows = list(seen.values())
 
     total = len(rows)
-    inserted = 0
-    print("   Загружаю {} строк батчами по {} ...".format(total, batch_size))
+    print("   [a] Заливаю {} строк в stock_staging батчами по {} ...".format(total, batch_size))
+
+    # чистим staging этого бренда заранее (если прошлый прогон упал)
+    try:
+        supabase_request("DELETE", staging_url + "?brand=eq." + brand_key, key,
+                         headers={"Prefer": "return=minimal"})
+    except Exception as e:
+        print("   ⚠ Не удалось очистить staging заранее: {}: {}".format(type(e).__name__, e))
 
     for i in range(0, total, batch_size):
         batch = rows[i:i + batch_size]
         try:
             r = supabase_request(
-                "POST", url, key, json=batch,
-                headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
-            )
+                "POST", staging_url, key, json=batch,
+                headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
             if r.status_code in (200, 201, 204):
-                inserted += len(batch)
                 print("      батч {:4d}-{:4d}: OK".format(i + 1, i + len(batch)))
             else:
-                err = "HTTP {}: {}".format(r.status_code, r.text[:300])
-                print("      батч {:4d}-{:4d}: FAIL {}".format(
-                    i + 1, i + len(batch), err))
-                return inserted, err
+                return None, "staging HTTP {}: {}".format(r.status_code, r.text[:300])
         except Exception as e:
-            err = "{}: {}".format(type(e).__name__, e)
-            print("      батч {:4d}-{:4d}: ERROR {}".format(
-                i + 1, i + len(batch), err))
-            return inserted, err
+            return None, "{}: {}".format(type(e).__name__, e)
 
-    return inserted, None
+    print("   [b] Вызываю apply_stock_snapshot('{}', '{}') ...".format(brand_key, snapshot_date))
+    rpc_url = supabase_url.rstrip("/") + "/rest/v1/rpc/apply_stock_snapshot"
+    try:
+        r = supabase_request("POST", rpc_url, key, json={
+            "p_brand": brand_key, "p_snapshot_date": snapshot_date})
+        if r.status_code not in (200, 201, 204):
+            return None, "rpc HTTP {}: {}".format(r.status_code, r.text[:300])
+        return (r.json() if r.text else {}), None
+    except Exception as e:
+        return None, "rpc {}: {}".format(type(e).__name__, e)
 
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
@@ -679,32 +627,39 @@ def process_brand(brand, supabase_url, supabase_key):
     run_id = supabase_log_run_start(supabase_url, supabase_key, brand_key)
 
     try:
-        inserted, err = upload_to_supabase(
+        result, err = upload_to_supabase(
             cars, supabase_url, supabase_key, brand_key)
         duration = int(time.time() - started)
 
         if err is None:
+            arrived = result.get("arrived", 0)
+            updated = result.get("updated", 0)
+            removed = result.get("removed", 0)
+            removal_done = result.get("removal_done", True)
+            note = result.get("note", "")
             supabase_log_run_finish(
                 supabase_url, supabase_key, run_id,
                 status="success",
-                rows_inserted=inserted,
+                rows_inserted=arrived + updated,
                 rows_total=len(cars),
                 duration_sec=duration,
+                error_message=note or None,
             )
-            print("\n✓ {}: загружено {}/{} строк за {} сек".format(
-                brand.upper(), inserted, len(cars), duration))
+            print("\n✓ {}: stock_cars обновлён за {} сек — приход {}, обновлено {}, выбытие {}".format(
+                brand.upper(), duration, arrived, updated, removed))
+            if not removal_done:
+                print("   ⚠ ВЫБЫТИЕ ПРОПУЩЕНО: {}".format(note))
             return True
         else:
             supabase_log_run_finish(
                 supabase_url, supabase_key, run_id,
-                status="partial" if inserted > 0 else "failed",
-                rows_inserted=inserted,
+                status="failed",
+                rows_inserted=0,
                 rows_total=len(cars),
                 duration_sec=duration,
                 error_message=err,
             )
-            print("\n⚠ {}: загрузка прервалась после {} строк: {}".format(
-                brand.upper(), inserted, err))
+            print("\n⚠ {}: загрузка не удалась: {}".format(brand.upper(), err))
             return False
 
     except Exception as e:
@@ -752,3 +707,5 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+    
