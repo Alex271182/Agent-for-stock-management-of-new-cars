@@ -1,0 +1,29 @@
+name: Dealer Models Sync
+
+on:
+  schedule:
+    # Раз в 2 недели: 1 и 15 числа, 01:00 UTC = 04:00 МСК (до WordStat-парсера в 05:00).
+    - cron: '0 1 1,15 * *'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Run dealer models sync
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python dealer_models_sync.py

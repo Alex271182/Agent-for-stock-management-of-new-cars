@@ -1,0 +1,33 @@
+name: WordStat Parse
+
+on:
+  schedule:
+    # 02:00 UTC = 05:00 МСК. С учётом задержки GitHub (0–60 мин) — фактически 05:00–06:00 МСК.
+    # Раньше складского парсера (он в 04:00 МСК) НЕ ставим — это разные данные, не конфликтуют.
+    - cron: '0 2 * * *'
+  workflow_dispatch:        # ручной запуск кнопкой Run workflow
+
+jobs:
+  wordstat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install playwright requests
+          python -m playwright install --with-deps chromium
+
+      - name: Run WordStat parser
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          YANDEX_SESSION_JSON: ${{ secrets.YANDEX_SESSION_JSON }}
+        run: python wordstat_supabase_parser.py
