@@ -7,8 +7,9 @@ JETOUR RF Stock Extractor  (v4)
 1. Собирает ВСЕ автомобили Jetour по всей РФ через API TradeDealer.
 2. Сохраняет CSV с расширенным набором полей (для подстраховки/Excel).
 3. Если рядом со скриптом есть .env с SUPABASE_URL и SUPABASE_SERVICE_ROLE_KEY,
-   дополнительно загружает данные в таблицу stock_snapshots и логирует запуск
-   в parsing_runs. Если .env нет — работает как раньше (CSV-only).
+   дополнительно заливает срез в stock_staging и вызывает серверную функцию
+   apply_stock_snapshot (мёрж в stock_cars: приход/обновление/выбытие) и логирует
+   запуск в parsing_runs. Если .env нет — работает как раньше (CSV-only).
 
 Изменения v4:
 - Добавлена опциональная загрузка в Supabase (без слома существующего CSV).
@@ -405,88 +406,13 @@ def print_stats(cars):
 
 
 # ─── ЗАГРУЗКА В SUPABASE (опционально) ──────────────────────────────────────
-# Брендовое имя для записи в stock_snapshots.brand
+# Брендовое имя для записи в stock_cars.brand / stock_staging.brand
 BRAND_KEY = "jetour"
 
 
-def _normalize_drive_type(raw):
-    """
-    Приводит "Передний (2WD)" / "Полный (4WD)" / "Полный (AWD)" / "Полный (XWD)" к
-    единому виду: "Передний" / "Полный" / "Задний".
-    Согласуется с _normalize_drive_type в perxis_playwright_extractor.py — у всех
-    брендов в БД формат становится одинаковым.
-    """
-    if not raw:
-        return None
-    s = str(raw).lower()
-    if "полн" in s:
-        return "Полный"
-    if "передн" in s:
-        return "Передний"
-    if "задн" in s:
-        return "Задний"
-    return raw  # ничего не подошло — не теряем данные
-
-
-def _normalize_transmission(transmission_obj):
-    """
-    Из объекта transmission Jetour API:
-        {"type":"robot", "title":"7G-DCT 7", "speeds":7, "automatic":true}
-    извлекает человекочитаемое название КПП.
-    Приоритет:
-      1) title (например, "7G-DCT 7", "8AT", "6 DCT") — самое информативное.
-      2) если title пуст — маппинг по type (robot→Робот, akpp→АКПП и т.д.).
-      3) если и type не известен — оставляем type как есть с заглавной буквы
-         (данные не теряем).
-    """
-    if not isinstance(transmission_obj, dict):
-        return None
-    title = transmission_obj.get("title")
-    if title and str(title).strip():
-        return str(title).strip()
-    type_alias = transmission_obj.get("type")
-    if not type_alias:
-        return None
-    alias_map = {
-        "robot": "Робот",
-        "akpp":  "АКПП",
-        "at":    "АКПП",
-        "mt":    "МКПП",
-        "mkpp":  "МКПП",
-        "cvt":   "Вариатор",
-        "dct":   "Робот",
-    }
-    key = str(type_alias).lower().strip()
-    if key in alias_map:
-        return alias_map[key]
-    # Неизвестный алиас — оставляем как есть, но с заглавной буквы
-    return str(type_alias).capitalize()
-
-
-def _extract_body_type(modif, car):
-    """
-    Достаёт человекочитаемое название кузова.
-    В API Jetour body — это объект {"type":"crossover","title":"Кроссовер",...},
-    а не строка. Раньше в БД писалась вся сериализованная структура целиком —
-    это была ошибка. Берём только title.
-    """
-    body_obj = modif.get("body") if isinstance(modif, dict) else None
-    if isinstance(body_obj, dict):
-        title = body_obj.get("title") or body_obj.get("typeTitle")
-        if title and str(title).strip():
-            return str(title).strip()
-    # fallback на car.body.title (на случай других схем ответа API)
-    car_body = car.get("body") if isinstance(car, dict) else None
-    if isinstance(car_body, dict):
-        title = car_body.get("title")
-        if title and str(title).strip():
-            return str(title).strip()
-    return None
-
-
-def car_to_supabase_row(car, snapshot_date):
-    """Преобразует JSON-объект машины в строку для таблицы stock_snapshots.
-    Поля сопоставлены с CSV-логикой car_to_row, но с типизацией под Postgres.
+def car_to_supabase_row(car):
+    """Преобразует JSON-объект машины в строку для stock_staging (без даты и raw_data).
+    Дата среза проставляется при заливке в staging.
     """
     company = car.get("company") or {}
     city = company.get("city") or {}
@@ -505,7 +431,7 @@ def car_to_supabase_row(car, snapshot_date):
     transmission = modif.get("transmission") or {}
     model = car.get("model") or {}
 
-    # Считаем days_on_stock сами (snapshot_date - published_at)
+    # Считаем days_on_stock сами (сегодня - published_at)
     published_at_str = car.get("publishedAt") or ""
     published_date = ""
     days_on_stock = None
@@ -513,7 +439,7 @@ def car_to_supabase_row(car, snapshot_date):
         try:
             published_date = published_at_str[:10]  # ISO → YYYY-MM-DD
             d_pub = datetime.strptime(published_date, "%Y-%m-%d").date()
-            d_snap = datetime.strptime(snapshot_date, "%Y-%m-%d").date()
+            d_snap = datetime.now().date()
             days_on_stock = (d_snap - d_pub).days
         except (ValueError, TypeError):
             published_date = ""
@@ -539,8 +465,6 @@ def car_to_supabase_row(car, snapshot_date):
             return None
 
     return {
-        # PK
-        "snapshot_date":      snapshot_date,
         "brand":              BRAND_KEY,
         "car_id":             str(car.get("id", "")),
 
@@ -558,34 +482,11 @@ def car_to_supabase_row(car, snapshot_date):
         "model_alias":        model.get("alias") or None,
         "complectation":      complect.get("titleRus") or None,
         "complectation_code": complect.get("mcode") or None,
-        # engine_volume / engine_power: в API Jetour лежат внутри modif.engine,
-        # а не на верхнем уровне modif. Старые ключи (volume/power/displacement/hp)
-        # оставлены как fallback на случай, если API в будущем изменится обратно.
-        "engine_volume":      _num_or_none(
-                                  get_nested(modif, "engine", "volume", default=None)
-                                  or modif.get("volume")
-                                  or modif.get("displacement")
-                              ),
-        "engine_power":       _int_or_none(
-                                  get_nested(modif, "engine", "power", default=None)
-                                  or get_nested(modif, "engine", "maxPower", default=None)
-                                  or modif.get("power")
-                                  or modif.get("hp")
-                              ),
-        "transmission_type":  _normalize_transmission(transmission),
-        # drive_type: в API Jetour поле называется drivetrainStructured (объект с title).
-        # Старые ключи wheel/drive оставлены как fallback. К результату применяем
-        # нормализацию, чтобы убрать суффиксы (2WD)/(4WD) и привести к единому формату
-        # с другими брендами.
-        "drive_type":         _normalize_drive_type(
-                                  get_nested(modif, "drivetrainStructured", "title", default=None)
-                                  or modif.get("wheel")
-                                  or modif.get("drive")
-                                  or None
-                              ),
-        # body_type: в API Jetour это объект {"type":"crossover","title":"Кроссовер",...}.
-        # Берём только title, чтобы в БД не попадала сериализованная структура целиком.
-        "body_type":          _extract_body_type(modif, car),
+        "engine_volume":      _num_or_none(modif.get("volume") or modif.get("displacement")),
+        "engine_power":       _int_or_none(modif.get("power") or modif.get("hp")),
+        "transmission_type":  transmission.get("type") or None,
+        "drive_type":         modif.get("wheel") or modif.get("drive") or None,
+        "body_type":          modif.get("body") or get_nested(car, "body", "title") or None,
         "color":              color.get("titleRus") or color.get("title") or None,
 
         # Цены / скидки
@@ -613,9 +514,6 @@ def car_to_supabase_row(car, snapshot_date):
         "parallel_import":    bool(car.get("parallelImport", False)),
         "mileage_km":         _int_or_none(car.get("run")),
         "is_used":            bool(car.get("used", False)),
-
-        # Сырой JSON (на случай редких полей)
-        "raw_data":           car,
     }
 
 
@@ -684,64 +582,75 @@ def supabase_log_run_finish(supabase_url, key, run_id, status,
 
 
 def upload_to_supabase(cars, supabase_url, key, batch_size=200):
-    """Загружает машины в stock_snapshots батчами через UPSERT.
-    UPSERT по PK (snapshot_date, brand, car_id) — повторный запуск в тот же
-    день обновляет, а не дублирует записи.
-    Возвращает (rows_inserted, error_message_or_None).
+    """Загружает срез в stock_staging батчами, затем вызывает серверную функцию
+    apply_stock_snapshot(brand, date), которая мёржит staging в stock_cars
+    (приход/обновление/выбытие с защитами) и чистит staging.
 
-    batch_size=200: уменьшено с 500, чтобы избежать statement_timeout
-    Supabase на больших UPSERT (наблюдалось 21.05.2026 — partial 1000/3685).
+    Возвращает (result_dict_or_None, error_message_or_None).
+    result_dict — JSON-ответ функции (arrived/updated/removed/removal_done/note).
+
+    batch_size=200: чтобы избежать statement_timeout Supabase на больших вставках.
     """
     snapshot_date = datetime.now().strftime("%Y-%m-%d")
-    url = supabase_url.rstrip("/") + "/rest/v1/stock_snapshots"
+    staging_url = supabase_url.rstrip("/") + "/rest/v1/stock_staging"
 
-    rows = [car_to_supabase_row(c, snapshot_date) for c in cars]
+    rows = [car_to_supabase_row(c) for c in cars]
+    for row in rows:
+        row["snapshot_date"] = snapshot_date
 
-    # Дедупликация по PK (snapshot_date + brand + car_id). API Jetour иногда
-    # отдаёт одну и ту же машину дважды на стыке страниц при пагинации.
-    # Postgres не позволяет в одной UPSERT-команде дважды затронуть одну строку.
-    # Оставляем последнее вхождение (свежее по позиции в выгрузке).
+    # Дедуп по (brand, car_id): API иногда отдаёт машину дважды на стыке страниц.
     seen = {}
     for row in rows:
-        pk = (row["snapshot_date"], row["brand"], row["car_id"])
-        seen[pk] = row
-    deduped_count = len(rows) - len(seen)
-    if deduped_count:
-        print("   ⚠ Дублей по car_id: {} (удалено из батчей)".format(deduped_count))
+        seen[(row["brand"], row["car_id"])] = row
+    deduped = len(rows) - len(seen)
+    if deduped:
+        print("   ⚠ Дублей по car_id: {} (удалено)".format(deduped))
     rows = list(seen.values())
 
     total = len(rows)
-    inserted = 0
-    print("   Загружаю {} строк в stock_snapshots батчами по {} ...".format(
-        total, batch_size))
+    print("   [a] Заливаю {} строк в stock_staging батчами по {} ...".format(total, batch_size))
 
+    # На всякий случай чистим staging этого бренда перед заливкой (если прошлый прогон упал)
+    try:
+        supabase_request(
+            "DELETE", staging_url + "?brand=eq." + BRAND_KEY, key,
+            headers={"Prefer": "return=minimal"})
+    except Exception as e:
+        print("   ⚠ Не удалось очистить staging заранее: {}: {}".format(type(e).__name__, e))
+
+    staged = 0
     for i in range(0, total, batch_size):
         batch = rows[i:i + batch_size]
         try:
-            # Prefer: resolution=merge-duplicates → UPSERT по PK
             r = supabase_request(
-                "POST", url, key,
-                json=batch,
-                headers={
-                    "Prefer": "resolution=merge-duplicates,return=minimal",
-                },
-            )
+                "POST", staging_url, key, json=batch,
+                headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
             if r.status_code in (200, 201, 204):
-                inserted += len(batch)
-                print("      батч {:3d}-{:3d}: OK".format(
-                    i + 1, i + len(batch)))
+                staged += len(batch)
+                print("      батч {:3d}-{:3d}: OK".format(i + 1, i + len(batch)))
             else:
-                err = "HTTP {}: {}".format(r.status_code, r.text[:300])
-                print("      батч {:3d}-{:3d}: FAIL {}".format(
-                    i + 1, i + len(batch), err))
-                return inserted, err
+                err = "staging HTTP {}: {}".format(r.status_code, r.text[:300])
+                print("      батч {:3d}-{:3d}: FAIL {}".format(i + 1, i + len(batch), err))
+                return None, err
         except Exception as e:
             err = "{}: {}".format(type(e).__name__, e)
-            print("      батч {:3d}-{:3d}: ERROR {}".format(
-                i + 1, i + len(batch), err))
-            return inserted, err
+            print("      батч {:3d}-{:3d}: ERROR {}".format(i + 1, i + len(batch), err))
+            return None, err
 
-    return inserted, None
+    # [b] Вызываем серверную функцию мёржа staging -> stock_cars
+    print("   [b] Вызываю apply_stock_snapshot('{}', '{}') ...".format(BRAND_KEY, snapshot_date))
+    rpc_url = supabase_url.rstrip("/") + "/rest/v1/rpc/apply_stock_snapshot"
+    try:
+        r = supabase_request("POST", rpc_url, key, json={
+            "p_brand":         BRAND_KEY,
+            "p_snapshot_date": snapshot_date,
+        })
+        if r.status_code not in (200, 201, 204):
+            return None, "rpc HTTP {}: {}".format(r.status_code, r.text[:300])
+        result = r.json() if r.text else {}
+        return result, None
+    except Exception as e:
+        return None, "rpc {}: {}".format(type(e).__name__, e)
 
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
@@ -772,30 +681,40 @@ def main():
         run_id = supabase_log_run_start(supabase_url, key)
 
         try:
-            inserted, err = upload_to_supabase(cars, supabase_url, key)
+            result, err = upload_to_supabase(cars, supabase_url, key)
             duration = int(time.time() - started)
 
             if err is None:
+                arrived = result.get("arrived", 0)
+                updated = result.get("updated", 0)
+                removed = result.get("removed", 0)
+                removal_done = result.get("removal_done", True)
+                note = result.get("note", "")
+                # rows_inserted в журнал = приход + обновление (сколько строк затронуто)
                 supabase_log_run_finish(
                     supabase_url, key, run_id,
                     status="success",
-                    rows_inserted=inserted,
+                    rows_inserted=arrived + updated,
                     rows_total=len(cars),
                     duration_sec=duration,
+                    error_message=note or None,
                 )
-                print("\n✓ Загружено в Supabase: {}/{} строк за {} сек".format(
-                    inserted, len(cars), duration))
+                print("\n✓ stock_cars обновлён за {} сек:".format(duration))
+                print("    приход (новые):     {}".format(arrived))
+                print("    обновлено:          {}".format(updated))
+                print("    выбытие:            {}".format(removed))
+                if not removal_done:
+                    print("    ⚠ ВЫБЫТИЕ ПРОПУЩЕНО: {}".format(note))
             else:
                 supabase_log_run_finish(
                     supabase_url, key, run_id,
-                    status="partial" if inserted > 0 else "failed",
-                    rows_inserted=inserted,
+                    status="failed",
+                    rows_inserted=0,
                     rows_total=len(cars),
                     duration_sec=duration,
                     error_message=err,
                 )
-                print("\n⚠ Загрузка прервалась после {} строк. Причина: {}"
-                      .format(inserted, err))
+                print("\n⚠ Загрузка не удалась. Причина: {}".format(err))
 
         except Exception as e:
             duration = int(time.time() - started)
@@ -818,5 +737,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-
-    
