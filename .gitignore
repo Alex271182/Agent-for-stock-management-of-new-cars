@@ -3,6 +3,9 @@
 .env.*
 !.env.example
 
+# Сессия Яндекса — только через Secret, не коммитить
+yandex_session.json
+
 # Python
 __pycache__/
 *.pyc
