@@ -3,13 +3,16 @@ WORDSTAT SUPABASE PARSER v2 (Python + Playwright)
 =================================================
 Парсит дневную динамику запросов из Яндекс.Вордстат по РФ и грузит в Supabase.
 
-ЧТО МЕРЯЕМ (решение сессии 30.05.2026):
-  По каждой модели берём broad-запрос (без суффиксов "купить"/"цена") на ДВУХ языках:
-    - латиница  (keyword)      — напр. "geely monjaro"
-    - кириллица (keyword_cyr)  — напр. "джили монжаро"
+ЧТО МЕРЯЕМ (решение сессии 30.05.2026, intent восстановлен 01.06.2026):
+  По каждой модели берём ТРИ типа запроса, каждый на ДВУХ языках (лат keyword + кир keyword_cyr):
+    - broad   (suffix='')        — широкий интерес, напр. "geely monjaro"
+    - купить  (suffix='купить')  — горячий интерес, напр. "geely monjaro купить"
+    - цена    (suffix='цена')    — горячий интерес, напр. "geely monjaro цена"
+  Все запросы в broad-режиме WordStat (фраза с любыми хвостами).
   WordStat НЕ схлопывает языки (проверено замером: лат 3 732 vs кир 15 756).
-  Итоговый интерес к модели = count_lat + count_cyr.
+  Итоговый интерес = count_lat + count_cyr (по каждому типу отдельной строкой с suffix).
   Оба числа + сами написания сохраняются раздельно (ручной контроль, п.3 сессии).
+  intent ("горячий" спрос) = строки suffix IN ('купить','цена').
 
 ИСТОЧНИК МОДЕЛЕЙ:
   Таблица wordstat_models (active=true). Латиница — из Major (dealer_models_sync.py).
@@ -323,53 +326,63 @@ async def scrape(headless: bool):
                 kw_cyr = (model.get("keyword_cyr") or "").strip()
                 print(f"[{idx}/{len(models)}] {brand} {name}", flush=True)
 
-                # латиница
-                lat_data = {}
-                if kw_lat:
-                    print(f"    лат '{kw_lat}' ...", end=" ", flush=True)
-                    lat_data, cap = await fetch_one(page, kw_lat, idx == 1, headless, context)
-                    if cap and headless:
-                        run_finish(rid, "failed", 0, 0,
-                                   int((datetime.now(timezone.utc) - started).total_seconds()),
-                                   "captcha on headless")
-                        await browser.close(); sys.exit(2)
-                    print(f"OK {len(lat_data)} дн" if lat_data else "пусто")
+                # Три типа запроса на модель: broad (''), intent 'купить', intent 'цена'.
+                # Каждый — на двух языках (лат keyword + кир keyword_cyr), в broad-режиме
+                # WordStat (фраза с любыми хвостами). Пишется отдельной строкой с suffix.
+                SUFFIXES = ["", "купить", "цена"]
+                for suf in SUFFIXES:
+                    q_lat = f"{kw_lat} {suf}".strip() if kw_lat else ""
+                    q_cyr = f"{kw_cyr} {suf}".strip() if kw_cyr else ""
+                    suf_label = suf or "broad"
 
-                # кириллица
-                cyr_data = {}
-                if kw_cyr:
-                    print(f"    кир '{kw_cyr}' ...", end=" ", flush=True)
-                    cyr_data, cap = await fetch_one(page, kw_cyr, False, headless, context)
-                    if cap and headless:
-                        run_finish(rid, "failed", 0, 0,
-                                   int((datetime.now(timezone.utc) - started).total_seconds()),
-                                   "captcha on headless")
-                        await browser.close(); sys.exit(2)
-                    print(f"OK {len(cyr_data)} дн" if cyr_data else "пусто")
-                else:
-                    warnings.append(f"{brand} {name}: нет keyword_cyr (только латиница)")
+                    # латиница
+                    lat_data = {}
+                    if q_lat:
+                        print(f"    [{suf_label}] лат '{q_lat}' ...", end=" ", flush=True)
+                        lat_data, cap = await fetch_one(page, q_lat, idx == 1 and suf == "", headless, context)
+                        if cap and headless:
+                            run_finish(rid, "failed", 0, 0,
+                                       int((datetime.now(timezone.utc) - started).total_seconds()),
+                                       "captcha on headless")
+                            await browser.close(); sys.exit(2)
+                        print(f"OK {len(lat_data)} дн" if lat_data else "пусто")
 
-                # объединение: count_lat + count_cyr = query_count
-                all_dates = set(lat_data) | set(cyr_data)
-                if not all_dates:
-                    warnings.append(f"{brand} {name}: пусто по обоим языкам")
-                    continue
-                for d in all_dates:
-                    cl = lat_data.get(d)
-                    cc = cyr_data.get(d)
-                    rows.append({
-                        "brand":       brand,
-                        "model_name":  name,
-                        "keyword":     kw_lat,
-                        "keyword_cyr": kw_cyr or None,
-                        "suffix":      "",
-                        "region_id":   REGION_ID,
-                        "search_date": d,
-                        "count_lat":   cl,
-                        "count_cyr":   cc,
-                        "query_count": (cl or 0) + (cc or 0),
-                    })
-                await page.wait_for_timeout(600)
+                    # кириллица
+                    cyr_data = {}
+                    if q_cyr:
+                        print(f"    [{suf_label}] кир '{q_cyr}' ...", end=" ", flush=True)
+                        cyr_data, cap = await fetch_one(page, q_cyr, False, headless, context)
+                        if cap and headless:
+                            run_finish(rid, "failed", 0, 0,
+                                       int((datetime.now(timezone.utc) - started).total_seconds()),
+                                       "captcha on headless")
+                            await browser.close(); sys.exit(2)
+                        print(f"OK {len(cyr_data)} дн" if cyr_data else "пусто")
+                    elif suf == "":
+                        warnings.append(f"{brand} {name}: нет keyword_cyr (только латиница)")
+
+                    # объединение: count_lat + count_cyr = query_count
+                    all_dates = set(lat_data) | set(cyr_data)
+                    if not all_dates:
+                        if suf == "":
+                            warnings.append(f"{brand} {name}: пусто по обоим языкам")
+                        continue
+                    for d in all_dates:
+                        cl = lat_data.get(d)
+                        cc = cyr_data.get(d)
+                        rows.append({
+                            "brand":       brand,
+                            "model_name":  name,
+                            "keyword":     kw_lat,
+                            "keyword_cyr": kw_cyr or None,
+                            "suffix":      suf,
+                            "region_id":   REGION_ID,
+                            "search_date": d,
+                            "count_lat":   cl,
+                            "count_cyr":   cc,
+                            "query_count": (cl or 0) + (cc or 0),
+                        })
+                    await page.wait_for_timeout(600)
         finally:
             await browser.close()
 
