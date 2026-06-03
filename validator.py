@@ -57,6 +57,8 @@ EXPECTED_BRANDS = {
     "Haval":    ["haval", "haval_pro"],
     "Geely":    ["geely"],
     "Belgee":   ["belgee"],
+    "Tank":     ["tank"],
+    "Wey":      ["wey"],
 }
 
 # Пороги
