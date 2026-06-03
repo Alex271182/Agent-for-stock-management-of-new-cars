@@ -1,21 +1,23 @@
 """
 Validator — проверяет качество данных после ежедневного парсинга.
 
-Запускается в 08:00 МСК (через час после старта парсеров в 07:00).
-Если что-то не так — шлёт алерт в Telegram.
+Запускается через 1 час после старта парсеров. Если что-то не так — шлёт
+алерт в Telegram.
 
-Проверки (по согласованной матрице):
-1. Парсер запустился сегодня (есть свежая запись в parsing_runs).
-2. Парсер завершился успешно (status = 'success').
-3. rows_inserted vs rows_total — расхождение не больше 2%.
-4. Сегодня vs вчера по бренду — падение не больше 30%, рост не больше 50%.
-5. Доля записей с пустыми ключевыми полями (model / price_base / dealer_name)
-   — не больше 5%.
+Проверки (адаптированы под новую архитектуру stock_cars, где одна строка =
+одна машина, INSERT только для новых car_id, UPDATE для уже существующих):
+  1. Парсер запустился сегодня (есть свежая запись в parsing_runs).
+  2. Парсер завершился успешно (status = 'success').
+  3. ИНВАРИАНТ: активный сток в БД должен ТОЧНО совпадать с rows_total
+     последнего прогона. Это главная проверка корректности логики
+     apply_stock_snapshot.
+  4. Размер сегодняшнего среза vs МЕДИАНА последних 7 дней —
+     падение не больше 30%, рост не больше 50%. Медиана устойчива к
+     одиночным аномальным дням (в отличие от сравнения с одним вчера).
+  5. Доля записей с пустыми ключевыми полями (model / price_base /
+     dealer_name) — не больше 5%.
 
-Бренды, которые ожидаем увидеть сегодня:
-  jetour, changan, uni, haval, geely, belgee
-  (haval_combo парсер раскладывается в БД на haval и haval_pro — оба
-  допустимы; если нет ни одного из них — алерт).
+Бренды: jetour, changan, uni, haval+haval_pro, geely, belgee.
 
 Переменные окружения:
   SUPABASE_URL
@@ -24,13 +26,13 @@ Validator — проверяет качество данных после еже
   TELEGRAM_CHAT_ID
 
 Выход:
-  exit 0 — все проверки прошли (алерт всё равно мог уйти, если были warnings,
-           но критических ошибок нет).
-  exit 1 — критическая ошибка валидатора (не смог подключиться к БД и т.п.).
+  exit 0 — все проверки прошли (алерт мог уйти, но критических ошибок нет).
+  exit 1 — критическая ошибка валидатора.
 """
 
 import os
 import sys
+import statistics
 from datetime import date, timedelta, datetime, timezone
 
 try:
@@ -46,10 +48,8 @@ from telegram_alert import send_alert
 
 # ─── НАСТРОЙКИ ────────────────────────────────────────────────────────────────
 
-# Какие бренды ожидаем в БД сегодня.
-# Ключ — логическое имя для отчёта.
-# Значение — список вариантов в поле brand (т.к. один парсер может писать
-# несколько брендов: haval_combo → haval + haval_pro).
+# Логическое имя → список brand-алиасов в БД.
+# Один парсер может писать несколько брендов (haval_combo → haval + haval_pro).
 EXPECTED_BRANDS = {
     "Jetour":   ["jetour"],
     "Changan":  ["changan"],
@@ -59,17 +59,12 @@ EXPECTED_BRANDS = {
     "Belgee":   ["belgee"],
 }
 
-# Пороги для алертов.
-ROW_INSERT_DELTA_PCT = 2.0      # rows_inserted vs rows_total
-DAY_OVER_DAY_DROP_PCT = 30.0    # падение к вчера
-DAY_OVER_DAY_RISE_PCT = 50.0    # рост к вчера
-EMPTY_FIELDS_PCT = 5.0          # доля записей с пустыми ключевыми полями
-
-# Бренды, для которых проверка rows_inserted vs rows_total не имеет смысла:
-# у их парсеров есть встроенная дедупликация, поэтому inserted ≤ total — by design.
-# Jetour: API дистрибьютера иногда отдаёт одну и ту же машину дважды на стыке
-# страниц пагинации. Парсер делает дедуп по car_id перед UPSERT в Supabase.
-SKIP_ROW_DELTA_CHECK = {"jetour"}
+# Пороги
+STOCK_INVARIANT_TOLERANCE = 0   # инвариант — расхождение ровно 0 машин
+DAY_OVER_MEDIAN_DROP_PCT = 30.0  # падение к медиане за 7 дней
+DAY_OVER_MEDIAN_RISE_PCT = 50.0  # рост к медиане за 7 дней
+EMPTY_FIELDS_PCT = 5.0           # доля записей с пустыми ключевыми полями
+MEDIAN_WINDOW_DAYS = 7           # размер окна для медианы
 
 # Ключевые поля, которые не должны быть пустыми
 KEY_FIELDS = ["model", "price_base", "dealer_name"]
@@ -83,24 +78,27 @@ def get_client() -> Client:
     return create_client(url, key)
 
 
-def pct_diff(a: int, b: int) -> float:
+def pct_diff(a: float, b: float) -> float:
     """Процент изменения от b к a. b=0 → 0 если a=0, иначе inf (вернём 999)."""
     if b == 0:
         return 0.0 if a == 0 else 999.0
     return (a - b) / b * 100.0
 
 
+def fmt(x: float) -> str:
+    """Округление числа для вывода в алерте."""
+    return f"{x:.0f}" if x == int(x) else f"{x:.1f}"
+
+
 # ─── ПРОВЕРКИ ─────────────────────────────────────────────────────────────────
 
-def check_parsing_runs(client: Client, today: date) -> list[str]:
+def check_parsing_runs(client: Client, today: date) -> tuple[list[str], dict[str, dict]]:
     """
-    Проверки 1, 2, 3: журнал запусков за сегодня.
-    Возвращает список текстов проблем (пусто = всё ок).
+    Проверки 1, 2: журнал запусков за сегодня.
+    Возвращает (список проблем, latest_by_brand для дальнейших проверок).
     """
-    problems = []
+    problems: list[str] = []
 
-    # Берём все запуски, у которых started_at >= начало сегодняшнего дня UTC.
-    # Парсер мог стартовать в 07:00 МСК = 04:00 UTC.
     today_start = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
 
     resp = (client.table("parsing_runs")
@@ -109,20 +107,20 @@ def check_parsing_runs(client: Client, today: date) -> list[str]:
             .execute())
     runs = resp.data or []
 
-    # Группируем последние запуски по brand
+    # Последний запуск по каждому brand
     latest_by_brand: dict[str, dict] = {}
     for run in runs:
         b = run["brand"]
         if b not in latest_by_brand or run["started_at"] > latest_by_brand[b]["started_at"]:
             latest_by_brand[b] = run
 
-    # Проверка 1: парсер запустился сегодня для каждого ожидаемого бренда
+    # Проверка 1: парсер запустился сегодня
     for logical_name, brand_aliases in EXPECTED_BRANDS.items():
         found = any(alias in latest_by_brand for alias in brand_aliases)
         if not found:
             problems.append(f"❌ <b>{logical_name}</b>: парсер сегодня не запускался")
 
-    # Проверки 2, 3: статус и расхождение rows_inserted/rows_total
+    # Проверка 2: статус
     for brand, run in latest_by_brand.items():
         status = run.get("status")
         if status not in ("success", "ok"):
@@ -131,37 +129,62 @@ def check_parsing_runs(client: Client, today: date) -> list[str]:
                 f"❌ <b>{brand}</b>: статус = <code>{status}</code>" +
                 (f"\n   <i>{err}</i>" if err else "")
             )
-            continue
 
-        inserted = run.get("rows_inserted") or 0
-        total = run.get("rows_total") or 0
-        if total > 0 and brand not in SKIP_ROW_DELTA_CHECK:
-            diff_pct = abs(inserted - total) / total * 100
-            if diff_pct > ROW_INSERT_DELTA_PCT:
+    return problems, latest_by_brand
+
+
+def check_stock_invariant(client: Client, latest_by_brand: dict[str, dict]) -> list[str]:
+    """
+    Проверка 3 (НОВАЯ — главный инвариант):
+    Активный сток в БД должен ТОЧНО совпадать с rows_total последнего прогона.
+
+    Если расходится — значит, функция apply_stock_snapshot отработала
+    некорректно (либо не отработала вообще). Это критический сбой логики.
+    """
+    problems: list[str] = []
+
+    for logical_name, aliases in EXPECTED_BRANDS.items():
+        for alias in aliases:
+            run = latest_by_brand.get(alias)
+            if not run or run.get("status") not in ("success", "ok"):
+                continue  # ошибки старта уже поймала check_parsing_runs
+
+            rows_total = run.get("rows_total") or 0
+
+            # Считаем активный сток через VIEW
+            resp = (client.table("v_stock_active")
+                    .select("car_id", count="exact", head=True)
+                    .eq("brand", alias)
+                    .execute())
+            active_in_db = resp.count or 0
+
+            diff = abs(active_in_db - rows_total)
+            if diff > STOCK_INVARIANT_TOLERANCE:
                 problems.append(
-                    f"⚠️ <b>{brand}</b>: расхождение rows_inserted={inserted} "
-                    f"vs rows_total={total} ({diff_pct:.1f}%)"
+                    f"🚨 <b>{alias}</b>: ИНВАРИАНТ НАРУШЕН — "
+                    f"активный сток в БД = {active_in_db}, "
+                    f"парсер увидел = {rows_total} (расхождение {diff}). "
+                    f"Проверь, отработала ли функция apply_stock_snapshot."
                 )
 
     return problems
 
 
-def check_day_over_day(client: Client, today: date) -> list[str]:
+def check_day_over_median(client: Client, today: date) -> list[str]:
     """
-    Проверка 4: сравнение размера сегодняшнего среза vs вчерашнего.
+    Проверка 4: сравнение размера сегодняшнего среза с МЕДИАНОЙ последних 7 дней.
 
-    Источник: parsing_runs (поле rows_total последнего успешного прогона за день).
-    В новой модели stock_cars нет суточных снимков, поэтому объём среза берём
-    из журнала прогонов — это то же число машин, что парсер видел в этот день.
-    За день может быть несколько прогонов (тесты/повторы) — берём ПОСЛЕДНИЙ
-    по started_at, т.к. он отражает итоговое состояние дня.
-    Логика и пороги (падение >30%, рост >50%) сохранены дословно.
+    Почему медиана, а не вчера:
+    - Один аномальный день (как Haval 02.06 со сбоем) не искажает базу.
+    - Возвращение к норме после аномалии не воспринимается как «рост».
+    - Сравнение более устойчивое и предсказуемое.
+
+    За каждый день берём ПОСЛЕДНИЙ прогон (если их было несколько).
     """
-    problems = []
-    yesterday = today - timedelta(days=1)
+    problems: list[str] = []
 
-    def totals_for_day(d: date) -> dict[str, int]:
-        """Сумма rows_total последних прогонов за день по каждому логическому бренду."""
+    def latest_runs_for_day(d: date) -> dict[str, int]:
+        """Сумма rows_total последних прогонов за день, сгруппированная по логическому бренду."""
         day_start = datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc)
         day_end = datetime.combine(d + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
         resp = (client.table("parsing_runs")
@@ -171,7 +194,6 @@ def check_day_over_day(client: Client, today: date) -> list[str]:
                 .execute())
         runs = resp.data or []
 
-        # последний прогон за день по каждому brand-алиасу
         latest: dict[str, dict] = {}
         for run in runs:
             b = run["brand"]
@@ -187,61 +209,68 @@ def check_day_over_day(client: Client, today: date) -> list[str]:
             bucket[logical_name] = total
         return bucket
 
-    today_counts = totals_for_day(today)
-    yest_counts = totals_for_day(yesterday)
+    today_counts = latest_runs_for_day(today)
 
-    for brand in EXPECTED_BRANDS:
-        t = today_counts[brand]
-        y = yest_counts[brand]
-        delta = pct_diff(t, y)
-        if delta < -DAY_OVER_DAY_DROP_PCT:
+    # Собираем медиану по последним 7 дням (не включая сегодня)
+    history_counts: dict[str, list[int]] = {name: [] for name in EXPECTED_BRANDS}
+    for offset in range(1, MEDIAN_WINDOW_DAYS + 1):
+        d = today - timedelta(days=offset)
+        day_counts = latest_runs_for_day(d)
+        for name, val in day_counts.items():
+            # Пропускаем нулевые дни (парсер не запускался в этот день)
+            if val > 0:
+                history_counts[name].append(val)
+
+    for name in EXPECTED_BRANDS:
+        t = today_counts[name]
+        history = history_counts[name]
+        if not history or t == 0:
+            continue  # нет с чем сравнивать, либо сегодня парсер не отработал
+        median_val = statistics.median(history)
+        delta = pct_diff(t, median_val)
+        if delta < -DAY_OVER_MEDIAN_DROP_PCT:
             problems.append(
-                f"⚠️ <b>{brand}</b>: падение к вчера {delta:+.1f}% "
-                f"(сегодня {t}, вчера {y})"
+                f"⚠️ <b>{name}</b>: падение к медиане за {MEDIAN_WINDOW_DAYS} дней "
+                f"{delta:+.1f}% (сегодня {t}, медиана {fmt(median_val)})"
             )
-        elif delta > DAY_OVER_DAY_RISE_PCT:
+        elif delta > DAY_OVER_MEDIAN_RISE_PCT:
             problems.append(
-                f"⚠️ <b>{brand}</b>: рост к вчера {delta:+.1f}% "
-                f"(сегодня {t}, вчера {y})"
+                f"⚠️ <b>{name}</b>: рост к медиане за {MEDIAN_WINDOW_DAYS} дней "
+                f"{delta:+.1f}% (сегодня {t}, медиана {fmt(median_val)})"
             )
 
     return problems
 
 
-def check_empty_fields(client: Client, today: date) -> list[str]:
+def check_empty_fields(client: Client) -> list[str]:
     """
     Проверка 5: доля записей с пустыми ключевыми полями.
 
-    Источник: stock_cars, активные машины (is_active=true) — это актуальный
-    сток на сегодня, прямой аналог "snapshot_date=today" в старой модели.
-    Логика (хотя бы одно ключевое поле NULL) и порог (>5%) сохранены дословно.
+    Источник: v_stock_active (активные машины, через VIEW).
+    Логика и порог (>5%) сохранены как раньше.
     """
-    problems = []
+    problems: list[str] = []
 
     for logical_name, aliases in EXPECTED_BRANDS.items():
         total_today = 0
         empty_count = 0
         for alias in aliases:
-            # Общее число активных записей бренда
-            total_resp = (client.table("stock_cars")
+            total_resp = (client.table("v_stock_active")
                           .select("car_id", count="exact", head=True)
-                          .eq("is_active", True)
                           .eq("brand", alias)
                           .execute())
             total_today += total_resp.count or 0
 
-            # Записи с пустыми ключевыми полями (хотя бы одно поле NULL)
             for field in KEY_FIELDS:
-                empty_resp = (client.table("stock_cars")
+                empty_resp = (client.table("v_stock_active")
                               .select("car_id", count="exact", head=True)
-                              .eq("is_active", True)
                               .eq("brand", alias)
                               .is_(field, "null")
                               .execute())
                 empty_count = max(empty_count, empty_resp.count or 0)
 
         if total_today == 0:
-            continue  # эту проблему уже поймает check_parsing_runs
+            continue
 
         empty_pct = empty_count / total_today * 100
         if empty_pct > EMPTY_FIELDS_PCT:
@@ -266,19 +295,19 @@ def main() -> int:
     all_problems: list[str] = []
 
     try:
-        all_problems += check_parsing_runs(client, today)
-        all_problems += check_day_over_day(client, today)
-        all_problems += check_empty_fields(client, today)
+        problems_runs, latest_by_brand = check_parsing_runs(client, today)
+        all_problems += problems_runs
+        all_problems += check_stock_invariant(client, latest_by_brand)
+        all_problems += check_day_over_median(client, today)
+        all_problems += check_empty_fields(client)
     except Exception as e:
         send_alert(f"🚨 <b>Validator упал на проверках</b>:\n<code>{e}</code>")
         return 1
 
     if not all_problems:
-        # Тихий успех — не спамим. Можно раз в неделю слать "все ок", но это позже.
         print(f"[{today}] ✅ Все проверки пройдены")
         return 0
 
-    # Группируем алерт
     header = f"🔔 <b>Проверка стоков {today.strftime('%d.%m.%Y')}</b>\n"
     body = "\n".join(all_problems)
     send_alert(header + "\n" + body)
