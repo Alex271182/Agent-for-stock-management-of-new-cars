@@ -59,6 +59,7 @@ EXPECTED_BRANDS = {
     "Belgee":   ["belgee"],
     "Tank":     ["tank"],
     "Wey":      ["wey"],
+    "GAC":      ["gac"],
 }
 
 # Пороги
