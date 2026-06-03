@@ -43,14 +43,18 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 CONFIG = {
     # Бренды, которые парсим за один запуск.
-    "brands_to_run": ["haval_combo", "geely", "belgee"],
+    "brands_to_run": ["haval_combo", "geely", "belgee", "tank", "wey"],
 
     "brands": {
         "haval_combo": {
             "url": "https://haval.ru/online-stock/",
             "space_id": "cof2bt8beucc73e9g9ng",
+            # Префиксы для разделения по моделям. Модель машины сравнивается
+            # по startswith() в верхнем регистре. Например, "DARGO" подмёт и
+            # "DARGO X"; "F7" подмёт и "F7X". Префикс должен быть таким, чтобы
+            # НЕ задевать модели из других bucket'ов.
             "split": {
-                "haval":     {"M6", "JOLION", "DARGO", "DARGO X", "F7", "F7X", "POER"},
+                "haval":     {"M6", "JOLION", "DARGO", "F7", "POER"},
                 "haval_pro": {"H3", "H5", "H7", "H9"},
             },
         },
@@ -63,6 +67,20 @@ CONFIG = {
             "url": "https://belgee.ru/cars-stock/",
             "space_id": "com9pcgbeucc7385megg",
             "brand_key": "belgee",
+        },
+        "tank": {
+            # На tank.ru публикуется только TANK (TANK 300/400/500/700).
+            # WEY живёт на отдельном сайте gwm-wey.ru (см. бренд wey ниже).
+            "url": "https://tank.ru/cars/",
+            "space_id": "d604ft8beucc73c5uv7g",
+            "brand_key": "tank",
+        },
+        "wey": {
+            # WEY имеет свой отдельный сайт (не объединён с TANK).
+            # space_id получен через perxis_space_id_probe.py.
+            "url": "https://gwm-wey.ru/online-stock/",
+            "space_id": "d606848beucc73c6qm40",
+            "brand_key": "wey",
         },
     },
 
@@ -514,8 +532,10 @@ def process_brand(brand, browser, sb_url, sb_key):
         for c in cars:
             model = (c.get("model") or "").upper().strip()
             matched = False
-            for bucket_name, model_set in settings["split"].items():
-                if model in model_set:
+            # Префиксное совпадение: модель машины должна начинаться с одного
+            # из префиксов bucket'а. Префиксы хранятся в верхнем регистре.
+            for bucket_name, prefix_set in settings["split"].items():
+                if any(model.startswith(p) for p in prefix_set):
                     buckets[bucket_name].append(c)
                     matched = True
                     break
