@@ -66,8 +66,14 @@ jobs:
         continue-on-error: true
         run: python changan_uni_stock_extractor.py
 
-      # Haval / Geely / Belgee через Playwright
-      - name: Run Perxis (Haval/Geely/Belgee) parser
+      # GAC (TradeDealer Locator, итерация по моделям)
+      - name: Run GAC parser
+        id: gac
+        continue-on-error: true
+        run: python gac_stock_extractor.py
+
+      # Haval / Geely / Belgee / Tank / Wey через Playwright (Perxis-сайты)
+      - name: Run Perxis (Haval/Geely/Belgee/Tank/Wey) parser
         id: perxis
         continue-on-error: true
         run: python perxis_playwright_extractor.py
@@ -79,6 +85,7 @@ jobs:
         run: |
           echo "Jetour:    ${{ steps.jetour.outcome }}"
           echo "Changan:   ${{ steps.changan_uni.outcome }}"
+          echo "GAC:       ${{ steps.gac.outcome }}"
           echo "Perxis:    ${{ steps.perxis.outcome }}"
 
   # ─────────────────────────────────────────────────────────────────────────
