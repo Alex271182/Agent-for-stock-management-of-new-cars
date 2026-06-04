@@ -62,6 +62,15 @@ EXPECTED_BRANDS = {
     "GAC":      ["gac"],
 }
 
+# Бренды, для которых пропускаем проверку инварианта active_in_db == rows_total.
+# Это бренды на платформе TradeDealer Locator (Jetour, GAC) — их API на стыке
+# страниц возвращает дубликаты car_id, поэтому rows_total > distinct(car_id).
+# В БД корректно попадают только уникальные машины, что вызывает стабильное
+# расхождение (Jetour: ~140, GAC: ~60). Это особенность данных, не баг логики.
+# Защита от реальных аномалий остаётся — в apply_stock_snapshot встроен
+# p_anomaly_ratio=0.5 (отказ при срезе < 50% от прежнего активного стока).
+SKIP_INVARIANT_CHECK = {"jetour", "gac"}
+
 # Пороги
 STOCK_INVARIANT_TOLERANCE = 0   # инвариант — расхождение ровно 0 машин
 DAY_OVER_MEDIAN_DROP_PCT = 30.0  # падение к медиане за 7 дней
@@ -151,6 +160,12 @@ def check_stock_invariant(client: Client, latest_by_brand: dict[str, dict]) -> l
             run = latest_by_brand.get(alias)
             if not run or run.get("status") not in ("success", "ok"):
                 continue  # ошибки старта уже поймала check_parsing_runs
+
+            # Бренды на TradeDealer Locator имеют дубликаты car_id в API —
+            # rows_total систематически больше distinct(car_id) в БД.
+            # Проверка инварианта для них всё равно даст ложный алерт.
+            if alias in SKIP_INVARIANT_CHECK:
+                continue
 
             rows_total = run.get("rows_total") or 0
 
