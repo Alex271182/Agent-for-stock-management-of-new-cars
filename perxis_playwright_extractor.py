@@ -43,18 +43,14 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 CONFIG = {
     # Бренды, которые парсим за один запуск.
-    "brands_to_run": ["haval_combo", "geely", "belgee", "tank", "wey"],
+    "brands_to_run": ["haval_combo", "geely", "belgee"],
 
     "brands": {
         "haval_combo": {
             "url": "https://haval.ru/online-stock/",
             "space_id": "cof2bt8beucc73e9g9ng",
-            # Префиксы для разделения по моделям. Модель машины сравнивается
-            # по startswith() в верхнем регистре. Например, "DARGO" подмёт и
-            # "DARGO X"; "F7" подмёт и "F7X". Префикс должен быть таким, чтобы
-            # НЕ задевать модели из других bucket'ов.
             "split": {
-                "haval":     {"M6", "JOLION", "DARGO", "F7", "POER"},
+                "haval":     {"M6", "JOLION", "DARGO", "DARGO X", "F7", "F7X", "POER"},
                 "haval_pro": {"H3", "H5", "H7", "H9"},
             },
         },
@@ -67,20 +63,6 @@ CONFIG = {
             "url": "https://belgee.ru/cars-stock/",
             "space_id": "com9pcgbeucc7385megg",
             "brand_key": "belgee",
-        },
-        "tank": {
-            # На tank.ru публикуется только TANK (TANK 300/400/500/700).
-            # WEY живёт на отдельном сайте gwm-wey.ru (см. бренд wey ниже).
-            "url": "https://tank.ru/cars/",
-            "space_id": "d604ft8beucc73c5uv7g",
-            "brand_key": "tank",
-        },
-        "wey": {
-            # WEY имеет свой отдельный сайт (не объединён с TANK).
-            # space_id получен через perxis_space_id_probe.py.
-            "url": "https://gwm-wey.ru/online-stock/",
-            "space_id": "d606848beucc73c6qm40",
-            "brand_key": "wey",
         },
     },
 
@@ -269,10 +251,12 @@ async (spaceId) => {
       sku:            d.sku || null,
       model:          models[d.model?.id]?.name || null,
       engine:         engines[d.engine?.id]?.name || null,
-      gearbox:        gearboxes[d.gearbox?.id]?.alternateName || null,
-      drivetrain:     drivetrains[d.drivetrain?.id]?.alternateName || null,
+      engine_volume:  engines[d.engine?.id]?.displacement || engines[d.engine?.id]?.volume || null,
+      engine_power:   engines[d.engine?.id]?.power || engines[d.engine?.id]?.horsepower || null,
+      gearbox:        gearboxes[d.gearbox?.id]?.alternateName || gearboxes[d.gearbox?.id]?.name || null,
+      drivetrain:     drivetrains[d.drivetrain?.id]?.alternateName || drivetrains[d.drivetrain?.id]?.name || null,
       exterior:       exteriors[d.exterior?.id]?.name || null,
-      version:        versions[d.version?.id]?.alternateName || null,
+      version:        versions[d.version?.id]?.alternateName || versions[d.version?.id]?.name || null,
       type:           d.type || null,
       condition:      d.condition || null,
       availability:   d.availability || null,
@@ -318,6 +302,38 @@ def transliterate_city(name):
     return s.strip("-")
 
 
+def _parse_engine_volume(engine_str):
+    """Вытаскивает объём двигателя из строки.
+    Примеры: '2.0T 238 л.с.' → 2.0; '2.0 л (218 л. с.)' → 2.0; '1.5 л (143 л.с.)' → 1.5
+    '299 л.с. / 380 Н·м' → None (нет объёма)
+    """
+    if not engine_str:
+        return None
+    m = re.search(r'\b(\d+\.\d+)', engine_str)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            pass
+    return None
+
+
+def _parse_engine_power(engine_str):
+    """Вытаскивает мощность двигателя из строки.
+    Примеры: '2.0T 238 л.с.' → 238; '2.0 л (218 л. с.)' → 218; '299 л.с. / 380 Н·м' → 299
+    """
+    if not engine_str:
+        return None
+    # Ищем число перед "л.с." / "л. с." / "л.с" (с вариациями пробелов и точек)
+    m = re.search(r'(\d{2,4})\s*л\.?\s*с\.?', engine_str, re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            pass
+    return None
+
+
 # ─── SUPABASE ROW ────────────────────────────────────────────────────────────
 def car_to_supabase_row(car, brand_key):
     return {
@@ -334,8 +350,10 @@ def car_to_supabase_row(car, brand_key):
         "model_alias":        None,
         "complectation":      car.get("version"),
         "complectation_code": None,
-        "engine_volume":      None,
-        "engine_power":       None,
+        # engine_volume/power берём из справочника vehicles_engines (поля displacement/power/volume).
+        # Если Perxis не вернул их отдельно — парсим из строки engine ("2.0T 238 л.с.", "2.0 л (218 л. с.)").
+        "engine_volume":      car.get("engine_volume") or _parse_engine_volume(car.get("engine")),
+        "engine_power":       car.get("engine_power") or _parse_engine_power(car.get("engine")),
         "transmission_type":  car.get("gearbox"),
         "drive_type":         car.get("drivetrain"),
         "body_type":          None,
@@ -532,10 +550,8 @@ def process_brand(brand, browser, sb_url, sb_key):
         for c in cars:
             model = (c.get("model") or "").upper().strip()
             matched = False
-            # Префиксное совпадение: модель машины должна начинаться с одного
-            # из префиксов bucket'а. Префиксы хранятся в верхнем регистре.
-            for bucket_name, prefix_set in settings["split"].items():
-                if any(model.startswith(p) for p in prefix_set):
+            for bucket_name, model_set in settings["split"].items():
+                if model in model_set:
                     buckets[bucket_name].append(c)
                     matched = True
                     break
