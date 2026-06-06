@@ -1,4 +1,4 @@
-name: Daily Stock Parse
+    name: Daily Stock Parse
 
 # 04:00 МСК = 01:00 UTC — запуск парсеров
 # 05:00 МСК = 02:00 UTC — запуск валидатора
@@ -32,7 +32,7 @@ jobs:
     if: |
       (github.event_name == 'schedule' && github.event.schedule == '0 1 * * *') ||
       (github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'parsers'))
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -94,10 +94,6 @@ jobs:
   validator:
     name: Run data quality validator
     runs-on: ubuntu-latest
-    # При workflow_dispatch с task=all валидатор ждёт парсеры через needs.
-    # Парсеры не блокируют валидатор (always()), даже если упали — он всё равно
-    # пробежит проверки и сообщит, что не так. При task=validator парсеры не
-    # запускаются вообще, поэтому needs трактуется как "пустая зависимость".
     needs: parsers
     if: |
       always() && (
