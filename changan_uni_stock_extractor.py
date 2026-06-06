@@ -251,7 +251,6 @@ def build_enrichment_maps(session, brand_settings, models):
             if not cars_data.get("load_more_endpoint"):
                 break
             page += 1
-            import time; time.sleep(CONFIG["delay_sec"])
         return ids
 
     for model in models:
