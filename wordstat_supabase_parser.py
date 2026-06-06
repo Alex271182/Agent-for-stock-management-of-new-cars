@@ -381,6 +381,10 @@ async def scrape(headless: bool):
                             "count_lat":   cl,
                             "count_cyr":   cc,
                             "query_count": (cl or 0) + (cc or 0),
+                            # явно проставляем время прогона: DEFAULT now() срабатывает
+                            # только при INSERT, а при UPSERT-обновлении метка замерзала.
+                            # Теперь parsed_at = реальное время прогона и при INSERT, и при UPDATE.
+                            "parsed_at":   started.isoformat(),
                         })
                     await page.wait_for_timeout(600)
         finally:
