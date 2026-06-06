@@ -213,6 +213,24 @@ async (spaceId) => {
     fetchRefChunked('vehicles_benefits', ids.benefit),
   ]);
 
+  // Фолбэк: часть машин не имеет прямой ссылки на gearbox/drivetrain.
+  // Но объект модели (vehicles_models) ВСЕГДА содержит эти данные — сайт
+  // дистрибьютора показывает КПП/привод именно оттуда.
+  // Добираем model-level gearbox/drivetrain IDs и загружаем их.
+  const modelGearboxIds = new Set();
+  const modelDriveIds   = new Set();
+  for (const m of Object.values(models)) {
+    if (m.gearbox?.id) modelGearboxIds.add(m.gearbox.id);
+    if (m.drivetrain?.id) modelDriveIds.add(m.drivetrain.id);
+  }
+  const [modelGearboxes, modelDrivetrains] = await Promise.all([
+    fetchRefChunked('vehicles_gearboxes', modelGearboxIds),
+    fetchRefChunked('vehicles_drivetrains', modelDriveIds),
+  ]);
+  // Объединяем: машина → модель → справочник
+  const allGearboxes   = Object.assign({}, gearboxes,   modelGearboxes);
+  const allDrivetrains = Object.assign({}, drivetrains,  modelDrivetrains);
+
   const result = [];
   for (const car of cars) {
     const d = car.data;
@@ -251,12 +269,18 @@ async (spaceId) => {
       sku:            d.sku || null,
       model:          models[d.model?.id]?.name || null,
       engine:         engines[d.engine?.id]?.name || null,
-      engine_volume:  engines[d.engine?.id]?.displacement || engines[d.engine?.id]?.volume || null,
-      engine_power:   engines[d.engine?.id]?.power || engines[d.engine?.id]?.horsepower || null,
-      gearbox:        gearboxes[d.gearbox?.id]?.alternateName || gearboxes[d.gearbox?.id]?.name || null,
-      drivetrain:     drivetrains[d.drivetrain?.id]?.alternateName || drivetrains[d.drivetrain?.id]?.name || null,
+      gearbox:        allGearboxes[d.gearbox?.id]?.alternateName
+                   || allGearboxes[d.gearbox?.id]?.name
+                   || allGearboxes[models[d.model?.id]?.gearbox?.id]?.alternateName
+                   || allGearboxes[models[d.model?.id]?.gearbox?.id]?.name
+                   || null,
+      drivetrain:     allDrivetrains[d.drivetrain?.id]?.alternateName
+                   || allDrivetrains[d.drivetrain?.id]?.name
+                   || allDrivetrains[models[d.model?.id]?.drivetrain?.id]?.alternateName
+                   || allDrivetrains[models[d.model?.id]?.drivetrain?.id]?.name
+                   || null,
       exterior:       exteriors[d.exterior?.id]?.name || null,
-      version:        versions[d.version?.id]?.alternateName || versions[d.version?.id]?.name || null,
+      version:        versions[d.version?.id]?.alternateName || null,
       type:           d.type || null,
       condition:      d.condition || null,
       availability:   d.availability || null,
@@ -302,38 +326,6 @@ def transliterate_city(name):
     return s.strip("-")
 
 
-def _parse_engine_volume(engine_str):
-    """Вытаскивает объём двигателя из строки.
-    Примеры: '2.0T 238 л.с.' → 2.0; '2.0 л (218 л. с.)' → 2.0; '1.5 л (143 л.с.)' → 1.5
-    '299 л.с. / 380 Н·м' → None (нет объёма)
-    """
-    if not engine_str:
-        return None
-    m = re.search(r'\b(\d+\.\d+)', engine_str)
-    if m:
-        try:
-            return float(m.group(1))
-        except ValueError:
-            pass
-    return None
-
-
-def _parse_engine_power(engine_str):
-    """Вытаскивает мощность двигателя из строки.
-    Примеры: '2.0T 238 л.с.' → 238; '2.0 л (218 л. с.)' → 218; '299 л.с. / 380 Н·м' → 299
-    """
-    if not engine_str:
-        return None
-    # Ищем число перед "л.с." / "л. с." / "л.с" (с вариациями пробелов и точек)
-    m = re.search(r'(\d{2,4})\s*л\.?\s*с\.?', engine_str, re.IGNORECASE)
-    if m:
-        try:
-            return int(m.group(1))
-        except ValueError:
-            pass
-    return None
-
-
 # ─── SUPABASE ROW ────────────────────────────────────────────────────────────
 def car_to_supabase_row(car, brand_key):
     return {
@@ -350,10 +342,8 @@ def car_to_supabase_row(car, brand_key):
         "model_alias":        None,
         "complectation":      car.get("version"),
         "complectation_code": None,
-        # engine_volume/power берём из справочника vehicles_engines (поля displacement/power/volume).
-        # Если Perxis не вернул их отдельно — парсим из строки engine ("2.0T 238 л.с.", "2.0 л (218 л. с.)").
-        "engine_volume":      car.get("engine_volume") or _parse_engine_volume(car.get("engine")),
-        "engine_power":       car.get("engine_power") or _parse_engine_power(car.get("engine")),
+        "engine_volume":      None,
+        "engine_power":       None,
         "transmission_type":  car.get("gearbox"),
         "drive_type":         car.get("drivetrain"),
         "body_type":          None,
