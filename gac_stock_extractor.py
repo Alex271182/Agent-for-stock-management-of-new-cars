@@ -356,6 +356,73 @@ def car_to_row(car):
     model = car.get("model") or {}
     generation = car.get("generation") or {}
 
+    # Парсинг modification.specifications — массив объектов {alias, value, unit, name}.
+    # Используется если modif["volume"]/["power"]/["wheel"] не заполнены напрямую
+    # (например для GAC S7 PHEV и других нестандартных моделей).
+    specs = {}
+    for group in (modif.get("specifications") or []):
+        for spec in (group.get("specifications") or []):
+            alias = spec.get("alias") or ""
+            value = spec.get("value") or ""
+            if alias and value:
+                specs[alias] = value
+
+    def _spec_volume():
+        """Объём двигателя из specifications: значение в см³ → литры."""
+        v = specs.get("obyem_dvigatelya") or specs.get("engine_displacement") or ""
+        if v:
+            try:
+                return round(int(str(v).split()[0]) / 1000, 1)
+            except (ValueError, IndexError):
+                pass
+        return None
+
+    def _spec_power():
+        """Мощность из specifications: '340250' → 340 л.с. (берём первые цифры)."""
+        v = specs.get("maximum_power_kW_at_rpm") or specs.get("power") or \
+            specs.get("maximum_power") or ""
+        if v:
+            try:
+                # Значение типа "340250" (л.с. при об/мин) — берём первые 2-3 цифры
+                s = str(v).strip()
+                # Если значение <= 1000 — это прямая мощность в л.с.
+                # Если > 1000 — это "л.с.||об/мин" слиплись, берём первые 3 цифры
+                num = int(re.match(r'(\d+)', s).group(1)) if re.match(r'(\d+)', s) else 0
+                if num > 1000:
+                    # "340250" → 340
+                    return int(s[:3])
+                return num if num > 0 else None
+            except (ValueError, AttributeError):
+                pass
+        return None
+
+    def _spec_drive():
+        """Тип привода из specifications."""
+        for alias in ("type_drive", "drive", "drivetrain", "wheel_drive"):
+            v = specs.get(alias) or ""
+            if v:
+                return v
+        return None
+
+    # Правильные пути к полям в TradeDealer API для GAC:
+    # - объём и мощность: modif["engine"]["volume"] / ["powerKw"]
+    # - привод: modif["drivetrainStructured"]["title"]
+    engine_obj  = modif.get("engine") or {}
+    drivetrain  = modif.get("drivetrainStructured") or {}
+
+    # engine_volume: из engine.volume → fallback на _spec_volume()
+    _vol = engine_obj.get("volume") or modif.get("volume") or modif.get("displacement") or _spec_volume()
+
+    # engine_power: из engine.powerKw (в кВт) → конвертируем в л.с. (×1.3596)
+    # Fallback: modif.power, modif.hp, _spec_power()
+    _power_kw = engine_obj.get("powerKw") or engine_obj.get("maxPowerKw")
+    _power = (round(_power_kw * 1.3596) if _power_kw else None) \
+             or modif.get("power") or modif.get("hp") or _spec_power()
+
+    # drive_type: из drivetrainStructured.title → fallback на modif.wheel / _spec_drive()
+    _drive = drivetrain.get("title") or drivetrain.get("alias") \
+             or modif.get("wheel") or modif.get("drive") or _spec_drive()
+
     return [
         # Идентификация
         car.get("id", ""), car.get("vin", ""), car.get("vin_full", ""),
@@ -366,10 +433,9 @@ def car_to_row(car):
         model.get("titleRus", ""), model.get("alias", ""),
         generation.get("titleRus", ""),
         complect.get("titleRus", ""), complect.get("mcode", ""),
-        modif.get("volume", "") or modif.get("displacement", ""),
-        modif.get("power", "") or modif.get("hp", ""),
+        _vol, _power,
         transmission.get("type", ""), transmission.get("title", ""),
-        modif.get("wheel", "") or modif.get("drive", ""),
+        _drive,
         modif.get("body", "") or get_nested(car, "body", "title"),
 
         # Цвет
