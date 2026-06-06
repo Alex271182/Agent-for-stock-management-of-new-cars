@@ -213,6 +213,87 @@ def fetch_cars_for_model(session, brand_settings, model):
     return cars
 
 
+
+def build_enrichment_maps(session, brand_settings, models):
+    """
+    Строит mapping {car_id → complectation_name} и {car_id → color_name}
+    через батчевые запросы по каждой комплектации и цвету модели.
+
+    Вместо 1 запроса на машину делает ~10 запросов на всю модель:
+      9 моделей × (4 компл. + 3 цвета) ≈ 63 запроса вместо 3900+.
+    """
+    compl_map = {}
+    color_map = {}
+    base = brand_settings["base_url"]
+    H = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+
+    def fetch_cars_by_filter(model_id, extra_param, extra_val):
+        """Возвращает список car.id для заданного фильтра (с пагинацией)."""
+        ids = []
+        page = 1
+        while page <= 200:
+            r = session.get(
+                f"{base}/api/internal/filter/stock/dicts",
+                params={"model_id": model_id, extra_param: extra_val,
+                        "with_cars": "1", "only_cars": "1", "page": str(page)},
+                headers=H, timeout=CONFIG["timeout"],
+            )
+            if r.status_code != 200:
+                break
+            cars_data = (r.json().get("cars_data") or {})
+            items = cars_data.get("items") or []
+            if not items:
+                break
+            for car in items:
+                cid = car.get("id")
+                if cid:
+                    ids.append(cid)
+            if not cars_data.get("load_more_endpoint"):
+                break
+            page += 1
+            import time; time.sleep(CONFIG["delay_sec"])
+        return ids
+
+    for model in models:
+        model_id = model.get("id")
+        model_name = model.get("name", "?")
+        if not model_id:
+            continue
+
+        # Справочник комплектаций и цветов для модели
+        r = session.get(
+            f"{base}/api/internal/filter/stock/dicts",
+            params={"model_id": model_id},
+            headers=H, timeout=CONFIG["timeout"],
+        )
+        if r.status_code != 200:
+            continue
+        fd = (r.json().get("filter_data") or {})
+        complectations = fd.get("complectations") or []
+        colors         = fd.get("colors") or []
+
+        print("   {:25s}: {} компл., {} цветов".format(
+            model_name, len(complectations), len(colors)))
+
+        for compl in complectations:
+            cid, cname = compl.get("id"), compl.get("name")
+            if not cid or not cname:
+                continue
+            for car_id in fetch_cars_by_filter(model_id, "complectation_id", cid):
+                compl_map[car_id] = cname
+
+        for color in colors:
+            colid, colname = color.get("id"), color.get("name")
+            if not colid or not colname:
+                continue
+            for car_id in fetch_cars_by_filter(model_id, "color_id", colid):
+                color_map[car_id] = colname
+
+    print("   Всего: complectation для {:,} машин, color для {:,}".format(
+        len(compl_map), len(color_map)))
+    return compl_map, color_map
+
+
 def fetch_all_cars(session, brand_settings, models):
     """Перебирает все модели и собирает весь сток."""
     print("[2/3] Загружаю каталог по моделям ...")
@@ -387,7 +468,7 @@ def transliterate_city(city_name):
     return alias.strip("-")
 
 
-def car_to_supabase_row(car, brand_key):
+def car_to_supabase_row(car, brand_key, compl_map=None, color_map=None):
     """Преобразует JSON-машину Changan/Uni в строку stock_staging (без даты и raw_data)."""
     salon = car.get("salon") or {}
     prices = car.get("prices") or {}
@@ -434,14 +515,14 @@ def car_to_supabase_row(car, brand_key):
         # Модель / комплектация
         "model":              car.get("_model_name") or car.get("name") or None,
         "model_alias":        None,
-        "complectation":      car.get("complectation") or car.get("trim") or None,
+        "complectation":      (compl_map or {}).get(car.get("id")) or car.get("complectation") or car.get("trim") or None,
         "complectation_code": None,
         "engine_volume":      _num(car.get("volume")),
         "engine_power":       _int(car.get("power")),
         "transmission_type":  car.get("kpp") or None,
         "drive_type":         car.get("gear") or None,
         "body_type":          None,
-        "color":              car.get("color") or None,
+        "color":              (color_map or {}).get(car.get("id")) or car.get("color") or None,
 
         # Цены / скидки
         "price_base":         _int(prices.get("current")),
@@ -530,14 +611,14 @@ def supabase_log_run_finish(supabase_url, key, run_id, status,
             type(e).__name__, e))
 
 
-def upload_to_supabase(cars, supabase_url, key, brand_key, batch_size=200):
+def upload_to_supabase(cars, supabase_url, key, brand_key, batch_size=200, compl_map=None, color_map=None):
     """Льёт срез бренда в stock_staging, затем вызывает apply_stock_snapshot(brand_key, date).
     Возвращает (result_dict_or_None, error_message_or_None).
     """
     snapshot_date = datetime.now().strftime("%Y-%m-%d")
     staging_url = supabase_url.rstrip("/") + "/rest/v1/stock_staging"
 
-    rows = [car_to_supabase_row(c, brand_key) for c in cars]
+    rows = [car_to_supabase_row(c, brand_key, compl_map=compl_map, color_map=color_map) for c in cars]
     for row in rows:
         row["snapshot_date"] = snapshot_date
 
@@ -615,6 +696,11 @@ def process_brand(brand, supabase_url, supabase_key):
 
     print_stats(cars)
 
+    # Обогащение: получаем complectation и color через батчевые запросы
+    # по справочникам модели (~63 запроса для Changan, секунды времени)
+    print("\n[2.5/3] Обогащение: complectation + color ...")
+    compl_map, color_map = build_enrichment_maps(session, brand_settings, models)
+
     out_path = save_csv(cars, brand_key)
     print("\n✓ CSV сохранён: {}".format(out_path.resolve()))
 
@@ -628,7 +714,8 @@ def process_brand(brand, supabase_url, supabase_key):
 
     try:
         result, err = upload_to_supabase(
-            cars, supabase_url, supabase_key, brand_key)
+            cars, supabase_url, supabase_key, brand_key,
+            compl_map=compl_map, color_map=color_map)
         duration = int(time.time() - started)
 
         if err is None:
@@ -707,5 +794,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-
-    
