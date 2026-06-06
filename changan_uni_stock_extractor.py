@@ -617,7 +617,7 @@ def upload_to_supabase(cars, supabase_url, key, brand_key, batch_size=200, compl
     snapshot_date = datetime.now().strftime("%Y-%m-%d")
     staging_url = supabase_url.rstrip("/") + "/rest/v1/stock_staging"
 
-    rows = [car_to_supabase_row(c, brand_key, compl_map=compl_map, color_map=color_map) for c in cars]
+    rows = [car_to_supabase_row(c, brand_key) for c in cars]
     for row in rows:
         row["snapshot_date"] = snapshot_date
 
@@ -695,11 +695,6 @@ def process_brand(brand, supabase_url, supabase_key):
 
     print_stats(cars)
 
-    # Обогащение: получаем complectation и color через батчевые запросы
-    # по справочникам модели (~63 запроса для Changan, секунды времени)
-    print("\n[2.5/3] Обогащение: complectation + color ...")
-    compl_map, color_map = build_enrichment_maps(session, brand_settings, models)
-
     out_path = save_csv(cars, brand_key)
     print("\n✓ CSV сохранён: {}".format(out_path.resolve()))
 
@@ -713,8 +708,7 @@ def process_brand(brand, supabase_url, supabase_key):
 
     try:
         result, err = upload_to_supabase(
-            cars, supabase_url, supabase_key, brand_key,
-            compl_map=compl_map, color_map=color_map)
+            cars, supabase_url, supabase_key, brand_key)
         duration = int(time.time() - started)
 
         if err is None:
