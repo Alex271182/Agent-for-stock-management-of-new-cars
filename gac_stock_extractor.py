@@ -443,6 +443,40 @@ def print_stats(cars):
 # Брендовое имя для записи в stock_cars.brand / stock_staging.brand
 BRAND_KEY = "gac"
 
+
+
+def _parse_compl_code(code):
+    """Вытаскивает engine_volume, engine_power, drive_type из mcode TradeDealer.
+
+    Формат кода: {model}-{комплект}-{volume}-{transmission}-{power}-{drive}
+    Примеры:
+        T2-Престиж-2.0-РКП-245-4WD    → vol=2.0, power=245, drive=4WD
+        GS4-GL-2.0-AMT-231-4WD        → vol=2.0, power=231, drive=4WD
+        Dashing-Комфорт-1.5-РКП-147-2WD → vol=1.5, power=147, drive=2WD
+
+    Используется как фолбэк, если API не вернул поля напрямую.
+    Возвращает (vol, power, drive) — каждый None, если не распознан.
+    """
+    if not code:
+        return None, None, None
+    vol = power = drive = None
+    m = re.search(r'\b(\d+\.\d+)\b', code)
+    if m:
+        try:
+            vol = float(m.group(1))
+        except ValueError:
+            pass
+    m = re.search(r'\b([24]WD)\b', code, re.IGNORECASE)
+    if m:
+        drive = m.group(1).upper()
+    m = re.search(r'-(\d{2,4})-[24]WD\b', code, re.IGNORECASE)
+    if m:
+        try:
+            power = int(m.group(1))
+        except ValueError:
+            pass
+    return vol, power, drive
+
 def car_to_supabase_row(car):
     """Преобразует JSON-объект машины в строку для stock_staging (без даты и raw_data).
     Дата среза проставляется при заливке в staging.
@@ -515,10 +549,16 @@ def car_to_supabase_row(car):
         "model_alias":        model.get("alias") or None,
         "complectation":      complect.get("titleRus") or None,
         "complectation_code": complect.get("mcode") or None,
-        "engine_volume":      _num_or_none(modif.get("volume") or modif.get("displacement")),
-        "engine_power":       _int_or_none(modif.get("power") or modif.get("hp")),
+        "engine_volume":      (lambda v, c: v if v is not None else _parse_compl_code(c)[0])(
+            _num_or_none(modif.get("volume") or modif.get("displacement")),
+            complect.get("mcode") or ""),
+        "engine_power":       (lambda p, c: p if p is not None else _parse_compl_code(c)[1])(
+            _int_or_none(modif.get("power") or modif.get("hp")),
+            complect.get("mcode") or ""),
         "transmission_type":  transmission.get("type") or None,
-        "drive_type":         modif.get("wheel") or modif.get("drive") or None,
+        "drive_type":         (lambda d, c: d if d is not None else _parse_compl_code(c)[2])(
+            modif.get("wheel") or modif.get("drive") or None,
+            complect.get("mcode") or ""),
         "body_type":          modif.get("body") or get_nested(car, "body", "title") or None,
         "color":              color.get("titleRus") or color.get("title") or None,
 
