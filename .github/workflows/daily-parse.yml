@@ -1,4 +1,4 @@
-    name: Daily Stock Parse 
+ name: Daily Stock Parse
 
 # 04:00 МСК = 01:00 UTC — запуск парсеров
 # 05:00 МСК = 02:00 UTC — запуск валидатора
