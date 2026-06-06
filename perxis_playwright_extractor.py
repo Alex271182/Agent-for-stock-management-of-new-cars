@@ -280,7 +280,7 @@ async (spaceId) => {
                    || allDrivetrains[models[d.model?.id]?.drivetrain?.id]?.name
                    || null,
       exterior:       exteriors[d.exterior?.id]?.name || null,
-      version:        versions[d.version?.id]?.alternateName || null,
+      version:        versions[d.version?.id]?.alternateName || versions[d.version?.id]?.name || null,
       type:           d.type || null,
       condition:      d.condition || null,
       availability:   d.availability || null,
