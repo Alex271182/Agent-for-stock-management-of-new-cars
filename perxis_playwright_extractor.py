@@ -43,7 +43,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 CONFIG = {
     # Бренды, которые парсим за один запуск.
-    "brands_to_run": ["haval_combo", "geely", "belgee"],
+    "brands_to_run": ["haval_combo", "geely", "belgee", "tank", "wey"],
 
     "brands": {
         "haval_combo": {
@@ -63,6 +63,16 @@ CONFIG = {
             "url": "https://belgee.ru/cars-stock/",
             "space_id": "com9pcgbeucc7385megg",
             "brand_key": "belgee",
+        },
+        "tank": {
+            "url": "https://tank.ru/cars/",
+            "space_id": "d604ft8beucc73c5uv7g",
+            "brand_key": "tank",
+        },
+        "wey": {
+            "url": "https://gwm-wey.ru/online-stock/",
+            "space_id": "d606848beucc73c6qm40",
+            "brand_key": "wey",
         },
     },
 
