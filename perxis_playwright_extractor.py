@@ -200,16 +200,19 @@ async (spaceId) => {
     return map;
   }
 
-  // fetchRefByGet — загружает объекты через client.get() вместо findPublished.
-  // Используется для коллекций где findPublished не видит часть элементов
-  // (например vehicles_versions у Geely после обновления Perxis).
-  async function fetchRefByGet(collectionId, idSet) {
+  // fetchRefHybrid — сначала findPublished (быстро, батчами),
+  // потом client.get() только для не найденных ID.
+  // Решает проблему Geely: часть версий не возвращается findPublished.
+  async function fetchRefHybrid(collectionId, idSet) {
     if (!idSet.size) return {};
-    const allIds = [...idSet];
-    const map = {};
-    const BATCH = 20;
-    for (let i = 0; i < allIds.length; i += BATCH) {
-      const batch = allIds.slice(i, i + BATCH);
+    const map = await fetchRefChunked(collectionId, idSet);
+    // Находим ID которые не нашлись через findPublished
+    const missing = [...idSet].filter(id => !(id in map));
+    if (!missing.length) return map;
+    // Догружаем через client.get() батчами по 10
+    const BATCH = 10;
+    for (let i = 0; i < missing.length; i += BATCH) {
+      const batch = missing.slice(i, i + BATCH);
       const results = await Promise.all(
         batch.map(id =>
           client.get({ spaceId, envId: ENV_ID, collectionId, itemId: id }, meta)
@@ -230,7 +233,7 @@ async (spaceId) => {
     fetchRefChunked('vehicles_drivetrains', ids.drivetrain),
     fetchRefChunked('vehicles_gearboxes', ids.gearbox),
     fetchRefChunked('vehicles_exteriors', ids.exterior),
-    fetchRefByGet('vehicles_versions', ids.version),   // get() видит все версии
+    fetchRefHybrid('vehicles_versions', ids.version),   // hybrid: findPublished + get() для пропущенных
     fetchRefChunked('dealers_dealerships', ids.dealership),
     fetchRefChunked('dealers_cities', ids.city),
     fetchRefChunked('vehicles_benefits', ids.benefit),
