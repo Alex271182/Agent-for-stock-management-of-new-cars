@@ -1,34 +1,22 @@
 name: Daily Stock Parse
 
-# 04:00 МСК = 01:00 UTC — запуск парсеров
-# 05:00 МСК = 02:00 UTC — запуск валидатора
-# Cron на GitHub может задерживаться на 3-4 часа при высокой нагрузке.
-# Сдвиг на 3 часа раньше относительно желаемых 07:00/08:00 МСК даёт буфер —
-# даже при максимальной задержке данные будут в БД к началу рабочего дня.
 on:
   schedule:
-    - cron: '0 1 * * *'   # 04:00 МСК — парсеры
-    - cron: '0 2 * * *'   # 05:00 МСК — валидатор
-  workflow_dispatch:       # ручной запуск (Actions → Run workflow)
+    - cron: '0 1 * * *'
+    - cron: '0 2 * * *'
+  workflow_dispatch:
     inputs:
       task:
         description: 'Что запустить'
         required: true
         default: 'all'
         type: choice
-        options:
-          - all
-          - parsers
-          - validator
+        options: [all, parsers, validator]
 
 jobs:
-  # ─────────────────────────────────────────────────────────────────────────
-  # ПАРСЕРЫ — запускаются по расписанию в 04:00 UTC или вручную
-  # ─────────────────────────────────────────────────────────────────────────
   parsers:
     name: Run all parsers
     runs-on: ubuntu-latest
-    # Запускаем только если: cron на 04:00 UTC ИЛИ ручной запуск с task=all/parsers
     if: |
       (github.event_name == 'schedule' && github.event.schedule == '0 1 * * *') ||
       (github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'parsers'))
@@ -36,61 +24,44 @@ jobs:
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      PERXIS_API_KEY: ${{ secrets.PERXIS_API_KEY }}
+      GAC_TOKEN: ${{ secrets.GAC_TOKEN }}
+      GAC_TOKEN_PRODUCT: ${{ secrets.GAC_TOKEN_PRODUCT }}
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12', cache: 'pip' }
+      - run: pip install -r requirements.txt
+      - run: playwright install --with-deps chromium
 
-      - name: Setup Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: 'pip'
-
-      - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Install Playwright Chromium
-        run: playwright install --with-deps chromium
-
-      # Jetour
-      - name: Run Jetour parser
+      - name: Jetour
         id: jetour
         continue-on-error: true
         run: python jetour_stock_extractor.py
 
-      # Changan + Uni (один скрипт)
-      - name: Run Changan + Uni parser
+      - name: Changan + Uni
         id: changan_uni
         continue-on-error: true
         run: python changan_uni_stock_extractor.py
 
-      # GAC (TradeDealer Locator, итерация по моделям)
-      - name: Run GAC parser
+      - name: GAC
         id: gac
         continue-on-error: true
         run: python gac_stock_extractor.py
 
-      # Haval / Geely / Belgee / Tank / Wey через Playwright (Perxis-сайты)
-      - name: Run Perxis (Haval/Geely/Belgee/Tank/Wey) parser
+      - name: Perxis (Haval/Geely/Belgee/Tank/Wey)
         id: perxis
         continue-on-error: true
         run: python perxis_playwright_extractor.py
 
-      # Итоговый статус: если ВСЕ упали — пометить шаг как failed,
-      # но не блокировать валидатор (он отдельный job).
       - name: Summary
         if: always()
         run: |
-          echo "Jetour:    ${{ steps.jetour.outcome }}"
-          echo "Changan:   ${{ steps.changan_uni.outcome }}"
-          echo "GAC:       ${{ steps.gac.outcome }}"
-          echo "Perxis:    ${{ steps.perxis.outcome }}"
+          echo "Jetour:  ${{ steps.jetour.outcome }}"
+          echo "Changan: ${{ steps.changan_uni.outcome }}"
+          echo "GAC:     ${{ steps.gac.outcome }}"
+          echo "Perxis:  ${{ steps.perxis.outcome }}"
 
-  # ─────────────────────────────────────────────────────────────────────────
-  # ВАЛИДАТОР — запускается в 05:00 UTC (час после парсеров) или вручную
-  # ─────────────────────────────────────────────────────────────────────────
   validator:
     name: Run data quality validator
     runs-on: ubuntu-latest
@@ -107,19 +78,10 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12', cache: 'pip' }
+      - run: pip install requests python-dotenv supabase
+      - run: python validator.py
 
-      - name: Setup Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: 'pip'
-
-      - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          pip install requests python-dotenv supabase
-
-      - name: Run validator
-        run: python validator.py
+    
