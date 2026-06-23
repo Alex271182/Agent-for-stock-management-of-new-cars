@@ -58,8 +58,8 @@ CONFIG = {
     # Если перестанут работать — обнови, открыв сайт gac.ru/cars/new/gac, DevTools→
     # Network→filter?brands[]=gac и скопировав значения _token / _tokenProduct
     # из URL.
-    "token":          "6lrnWQ8cAs3oG0Nj",
-    "token_product":  "iOiWW0Nqlc4oeYCx",
+    "token":          os.environ.get("GAC_TOKEN", "6lrnWQ8cAs3oG0Nj"),
+    "token_product":  os.environ.get("GAC_TOKEN_PRODUCT", "iOiWW0Nqlc4oeYCx"),
 
     # Параметры запроса к API
     "brand":      "gac",
