@@ -43,7 +43,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 CONFIG = {
     # Бренды, которые парсим за один запуск.
-    "brands_to_run": ["haval_combo", "geely", "belgee", "tank", "wey"],
+    "brands_to_run": ["haval_combo", "geely", "belgee"],
 
     "brands": {
         "haval_combo": {
@@ -64,16 +64,6 @@ CONFIG = {
             "space_id": "com9pcgbeucc7385megg",
             "brand_key": "belgee",
         },
-        "tank": {
-            "url": "https://tank.ru/cars/",
-            "space_id": "d604ft8beucc73c5uv7g",
-            "brand_key": "tank",
-        },
-        "wey": {
-            "url": "https://gwm-wey.ru/online-stock/",
-            "space_id": "d606848beucc73c6qm40",
-            "brand_key": "wey",
-        },
     },
 
     "page_load_timeout_ms":   60000,
@@ -89,7 +79,7 @@ CONFIG = {
 JS_EXTRACTOR = r"""
 async (spaceId) => {
   const ENV_ID = 'master';
-  const API_KEY = 'yOhXS74DhPd5L2fEdUVmUPDRimporter';
+  const API_KEY = arguments[1];  // env: PERXIS_API_KEY
   const COLLECTION = 'vehicles_vehicles';
   const PAGE = 1000;          // размер страницы
   const MAX_PAGES = 200;      // защита от бесконечного цикла (200 * 1000 = 200 000 машин max)
@@ -210,32 +200,6 @@ async (spaceId) => {
     return map;
   }
 
-  // fetchRefHybrid — сначала findPublished (быстро, батчами),
-  // потом client.get() только для не найденных ID.
-  // Решает проблему Geely: часть версий не возвращается findPublished.
-  async function fetchRefHybrid(collectionId, idSet) {
-    if (!idSet.size) return {};
-    const map = await fetchRefChunked(collectionId, idSet);
-    // Находим ID которые не нашлись через findPublished
-    const missing = [...idSet].filter(id => !(id in map));
-    if (!missing.length) return map;
-    // Догружаем через client.get() батчами по 10
-    const BATCH = 10;
-    for (let i = 0; i < missing.length; i += BATCH) {
-      const batch = missing.slice(i, i + BATCH);
-      const results = await Promise.all(
-        batch.map(id =>
-          client.get({ spaceId, envId: ENV_ID, collectionId, itemId: id }, meta)
-            .catch(() => null)
-        )
-      );
-      for (const r of results) {
-        if (r?.item) map[r.item.id] = r.item.data;
-      }
-    }
-    return map;
-  }
-
   const [models, engines, drivetrains, gearboxes, exteriors, versions,
          dealerships, cities, benefits] = await Promise.all([
     fetchRefChunked('vehicles_models', ids.model),
@@ -243,29 +207,11 @@ async (spaceId) => {
     fetchRefChunked('vehicles_drivetrains', ids.drivetrain),
     fetchRefChunked('vehicles_gearboxes', ids.gearbox),
     fetchRefChunked('vehicles_exteriors', ids.exterior),
-    fetchRefHybrid('vehicles_versions', ids.version),   // hybrid: findPublished + get() для пропущенных
+    fetchRefChunked('vehicles_versions', ids.version),
     fetchRefChunked('dealers_dealerships', ids.dealership),
     fetchRefChunked('dealers_cities', ids.city),
     fetchRefChunked('vehicles_benefits', ids.benefit),
   ]);
-
-  // Фолбэк: часть машин не имеет прямой ссылки на gearbox/drivetrain.
-  // Но объект модели (vehicles_models) ВСЕГДА содержит эти данные — сайт
-  // дистрибьютора показывает КПП/привод именно оттуда.
-  // Добираем model-level gearbox/drivetrain IDs и загружаем их.
-  const modelGearboxIds = new Set();
-  const modelDriveIds   = new Set();
-  for (const m of Object.values(models)) {
-    if (m.gearbox?.id) modelGearboxIds.add(m.gearbox.id);
-    if (m.drivetrain?.id) modelDriveIds.add(m.drivetrain.id);
-  }
-  const [modelGearboxes, modelDrivetrains] = await Promise.all([
-    fetchRefChunked('vehicles_gearboxes', modelGearboxIds),
-    fetchRefChunked('vehicles_drivetrains', modelDriveIds),
-  ]);
-  // Объединяем: машина → модель → справочник
-  const allGearboxes   = Object.assign({}, gearboxes,   modelGearboxes);
-  const allDrivetrains = Object.assign({}, drivetrains,  modelDrivetrains);
 
   const result = [];
   for (const car of cars) {
@@ -305,18 +251,10 @@ async (spaceId) => {
       sku:            d.sku || null,
       model:          models[d.model?.id]?.name || null,
       engine:         engines[d.engine?.id]?.name || null,
-      gearbox:        allGearboxes[d.gearbox?.id]?.alternateName
-                   || allGearboxes[d.gearbox?.id]?.name
-                   || allGearboxes[models[d.model?.id]?.gearbox?.id]?.alternateName
-                   || allGearboxes[models[d.model?.id]?.gearbox?.id]?.name
-                   || null,
-      drivetrain:     allDrivetrains[d.drivetrain?.id]?.alternateName
-                   || allDrivetrains[d.drivetrain?.id]?.name
-                   || allDrivetrains[models[d.model?.id]?.drivetrain?.id]?.alternateName
-                   || allDrivetrains[models[d.model?.id]?.drivetrain?.id]?.name
-                   || null,
+      gearbox:        gearboxes[d.gearbox?.id]?.alternateName || null,
+      drivetrain:     drivetrains[d.drivetrain?.id]?.alternateName || null,
       exterior:       exteriors[d.exterior?.id]?.name || null,
-      version:        versions[d.version?.id]?.alternateName || versions[d.version?.id]?.name || null,
+      version:        versions[d.version?.id]?.alternateName || null,
       type:           d.type || null,
       condition:      d.condition || null,
       availability:   d.availability || null,
@@ -512,6 +450,7 @@ def extract_brand_via_browser(brand, browser):
     settings = CONFIG["brands"][brand]
     url = settings["url"]
     space_id = settings["space_id"]
+    api_key = os.environ.get("PERXIS_API_KEY", "yOhXS74DhPd5L2fEdUVmUPDRimporter")
 
     print("\n" + "=" * 60)
     print("Бренд: {}".format(brand.upper()))
@@ -535,7 +474,7 @@ def extract_brand_via_browser(brand, browser):
         page.wait_for_timeout(5000)
 
         print("   → Выполняю JS-парсер (может занять до 5 минут) ...")
-        result = page.evaluate(JS_EXTRACTOR, space_id)
+        result = page.evaluate(JS_EXTRACTOR, space_id, api_key)
 
         if not result or result.get("error"):
             err = result.get("error") if result else "пустой результат"
