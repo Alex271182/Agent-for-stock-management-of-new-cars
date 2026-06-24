@@ -77,9 +77,9 @@ CONFIG = {
 
 # ─── JS-парсер, который Playwright выполнит на странице ─────────────────────
 JS_EXTRACTOR = r"""
-async (spaceId) => {
+async ([spaceId, apiKey]) => {
   const ENV_ID = 'master';
-  const API_KEY = arguments[1];  // env: PERXIS_API_KEY
+  const API_KEY = apiKey || 'yOhXS74DhPd5L2fEdUVmUPDRimporter';
   const COLLECTION = 'vehicles_vehicles';
   const PAGE = 1000;          // размер страницы
   const MAX_PAGES = 200;      // защита от бесконечного цикла (200 * 1000 = 200 000 машин max)
@@ -474,7 +474,7 @@ def extract_brand_via_browser(brand, browser):
         page.wait_for_timeout(5000)
 
         print("   → Выполняю JS-парсер (может занять до 5 минут) ...")
-        result = page.evaluate(JS_EXTRACTOR, space_id, api_key)
+        result = page.evaluate(JS_EXTRACTOR, [space_id, api_key])
 
         if not result or result.get("error"):
             err = result.get("error") if result else "пустой результат"
