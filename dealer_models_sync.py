@@ -20,8 +20,14 @@ DEALER MODELS SYNC (ТТС → wordstat_models)
        NOVIY/NEW/GWM/PLUS/PRO/FL/MAX/+/годы. НЕ трогаем значащие части.
        Проверено на Belgee: s50->S50, x50plus->X50, x70-fl->X70.
   5. keyword (латиница) = "<brand> <base_model>".
-  6. Кириллицу скрипт НЕ генерирует (решение 10: без платного LLM).
-     Новая модель -> keyword_cyr=NULL, keyword_cyr_source="manual", предупреждение в журнал.
+  6. Кириллица (решение 10 + автоген 05.07.2026):
+       - НОВАЯ модель: если модельная часть содержит цифру (H6, T4L, EX5) — генерим
+         keyword_cyr автоматически = "<бренд-кир> <модель как есть латиницей>",
+         где бренд-кир берётся из существующей active-строки этого бренда.
+         keyword_cyr_source="auto".
+       - Если модельная часть — слово без цифр (Coolray, Dashing) ИЛИ бренд-кириллицы
+         ещё нет нигде: keyword_cyr=NULL, keyword_cyr_source="manual", флаг в журнал.
+       - Платный LLM НЕ используется.
   7. ГЛОБАЛЬНЫЙ ДЕДУП перед записью: если два слага свернулись в один (brand, model_name) —
      оставляем один. Иначе HTTP 409 duplicate key (баг прошлой сессии на Belgee S50).
   8. UPSERT в wordstat_models. ВСЕ объекты имеют ОДИНАКОВЫЙ набор ключей (иначе PGRST102).
@@ -275,6 +281,40 @@ def collapse_model(model_slug, brand, brand_slug):
     return model_name, keyword_lat
 
 
+# ─── АВТОГЕНЕРАЦИЯ КИРИЛЛИЦЫ (05.07.2026) ────────────────────────────────────
+def build_brand_cyr_map(existing):
+    """
+    Собирает {brand: "<бренд-кириллица>"} из существующих строк с заполненным keyword_cyr.
+    Бренд-кириллица = первое слово keyword_cyr (напр. "джили монжаро" -> "джили").
+    Берём наиболее частое первое слово по бренду (защита от опечаток в отдельных строках).
+    """
+    from collections import Counter, defaultdict
+    per_brand = defaultdict(Counter)
+    for (brand, _), row in existing.items():
+        cyr = (row.get("keyword_cyr") or "").strip()
+        if cyr:
+            first = cyr.split()[0]
+            if re.search(r"[а-яё]", first):
+                per_brand[brand][first] += 1
+    return {b: c.most_common(1)[0][0] for b, c in per_brand.items() if c}
+
+
+def auto_cyrillic(brand, model_name, brand_cyr_map):
+    """
+    Пытается сгенерировать keyword_cyr для НОВОЙ модели.
+    Правило (подтверждено пользователем 05.07.2026):
+      - модельная часть содержит цифру (H6, T4L, EX5) -> keyword_cyr = "<бренд-кир> <модель латиницей как есть>"
+      - модельная часть без цифр (слово: Coolray) ИЛИ нет бренд-кириллицы -> None (ручное заполнение)
+    Возвращает (keyword_cyr | None, source: 'auto'|'manual').
+    """
+    brand_cyr = brand_cyr_map.get(brand)
+    has_digit = bool(re.search(r"\d", model_name))
+    if brand_cyr and has_digit:
+        model_part = model_name.lower().strip()
+        return f"{brand_cyr} {model_part}", "auto"
+    return None, "manual"
+
+
 # ─── ОСНОВНОЕ ────────────────────────────────────────────────────────────────
 def main():
     if not (SB_URL and SB_KEY):
@@ -282,13 +322,14 @@ def main():
         sys.exit(1)
 
     existing = load_existing()
+    brand_cyr_map = build_brand_cyr_map(existing)   # бренд -> кириллица (из существующих строк)
     seen_now = set()
     # глобальный дедуп: (brand, model_name) -> row. Защита от HTTP 409.
     rows_by_key = {}
     warnings = []
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    print(f"=== ТТС-sync | брендов: {len(BRANDS)} ===\n")
+    print(f"=== ТТС-sync | брендов: {len(BRANDS)} | бренд-кириллиц известно: {len(brand_cyr_map)} ===\n")
 
     for brand, slug in BRANDS.items():
         print(f"[{brand}] {TTS_BASE}{slug}/ ...", flush=True)
@@ -312,10 +353,15 @@ def main():
             seen_now.add(key)
             if key in existing:
                 prev_cyr = existing[key].get("keyword_cyr")
+                # существующую кириллицу НЕ трогаем; source оставляем manual (не знаем исходный)
                 rows_by_key[key] = _full_row(brand, model_name, kw_lat, prev_cyr, "manual", now_iso)
             else:
-                warnings.append(f"{brand} {model_name}: новая, keyword_cyr=NULL — вписать вручную")
-                rows_by_key[key] = _full_row(brand, model_name, kw_lat, None, "manual", now_iso)
+                cyr, src = auto_cyrillic(brand, model_name, brand_cyr_map)
+                if cyr:
+                    print(f"   + новая: {model_name} -> кириллица авто: '{cyr}'")
+                else:
+                    warnings.append(f"{brand} {model_name}: новая, keyword_cyr=NULL — вписать вручную (модель-слово или нет бренд-кириллицы)")
+                rows_by_key[key] = _full_row(brand, model_name, kw_lat, cyr, src, now_iso)
         time.sleep(PAUSE_BETWEEN_BRANDS)
 
     # глобально дедуплицированный список (баг 409 закрыт)
