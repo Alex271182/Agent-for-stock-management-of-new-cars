@@ -58,6 +58,8 @@ CONFIG = {
             "url": "https://www.geely-motors.com/cars-stock/",
             "space_id": "cmodn3anifss73b1p3ug",
             "brand_key": "geely",
+            "alt_space_id": "d0rahr8beucc73aj6v3g",  # новый space с 24.06.2026
+            "alt_env_id":   "d0rahrobeucc73aj6v40",
         },
         "belgee": {
             "url": "https://belgee.ru/cars-stock/",
@@ -87,7 +89,7 @@ CONFIG = {
 
 # ─── JS-парсер, который Playwright выполнит на странице ─────────────────────
 JS_EXTRACTOR = r"""
-async ([spaceId, apiKey]) => {
+async ([spaceId, apiKey, altSpaceId, altEnvId]) => {
   const ENV_ID = 'master';
   const API_KEY = apiKey || 'yOhXS74DhPd5L2fEdUVmUPDRimporter';
   const COLLECTION = 'vehicles_vehicles';
@@ -210,6 +212,45 @@ async ([spaceId, apiKey]) => {
     return map;
   }
 
+
+  // fetchRefHybrid — 3-этапный поиск:
+  // 1. findPublished в основном space
+  // 2. client.get() для не найденных
+  // 3. client.get() в altSpaceId (для Geely: новый space с 24.06.2026)
+  async function fetchRefHybrid(collectionId, idSet) {
+    if (!idSet.size) return {};
+    const map = await fetchRefChunked(collectionId, idSet);
+    const missing = [...idSet].filter(id => !(id in map));
+    if (!missing.length) return map;
+    const BATCH = 10;
+    // Шаг 2: client.get() в основном space
+    for (let i = 0; i < missing.length; i += BATCH) {
+      const batch = missing.slice(i, i + BATCH);
+      const results = await Promise.all(
+        batch.map(id =>
+          client.get({ spaceId, envId: ENV_ID, collectionId, itemId: id }, meta)
+            .catch(() => null)
+        )
+      );
+      for (const r of results) { if (r?.item) map[r.item.id] = r.item.data; }
+    }
+    // Шаг 3: alt space (Geely → новый SpaceID)
+    if (altSpaceId) {
+      const stillMissing = [...idSet].filter(id => !(id in map));
+      for (let i = 0; i < stillMissing.length; i += BATCH) {
+        const batch = stillMissing.slice(i, i + BATCH);
+        const results = await Promise.all(
+          batch.map(id =>
+            client.get({ spaceId: altSpaceId, envId: altEnvId || ENV_ID, collectionId, itemId: id }, meta)
+              .catch(() => null)
+          )
+        );
+        for (const r of results) { if (r?.item) map[r.item.id] = r.item.data; }
+      }
+    }
+    return map;
+  }
+
   const [models, engines, drivetrains, gearboxes, exteriors, versions,
          dealerships, cities, benefits] = await Promise.all([
     fetchRefChunked('vehicles_models', ids.model),
@@ -217,7 +258,7 @@ async ([spaceId, apiKey]) => {
     fetchRefChunked('vehicles_drivetrains', ids.drivetrain),
     fetchRefChunked('vehicles_gearboxes', ids.gearbox),
     fetchRefChunked('vehicles_exteriors', ids.exterior),
-    fetchRefChunked('vehicles_versions', ids.version),
+    fetchRefHybrid('vehicles_versions', ids.version),   // + alt space для Geely
     fetchRefChunked('dealers_dealerships', ids.dealership),
     fetchRefChunked('dealers_cities', ids.city),
     fetchRefChunked('vehicles_benefits', ids.benefit),
@@ -484,7 +525,9 @@ def extract_brand_via_browser(brand, browser):
         page.wait_for_timeout(5000)
 
         print("   → Выполняю JS-парсер (может занять до 5 минут) ...")
-        result = page.evaluate(JS_EXTRACTOR, [space_id, api_key])
+        alt_space_id = settings.get("alt_space_id", "")
+        alt_env_id   = settings.get("alt_env_id", "")
+        result = page.evaluate(JS_EXTRACTOR, [space_id, api_key, alt_space_id, alt_env_id])
 
         if not result or result.get("error"):
             err = result.get("error") if result else "пустой результат"
