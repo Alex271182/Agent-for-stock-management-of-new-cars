@@ -4,46 +4,32 @@ DEALER MODELS SYNC (ТТС → wordstat_models)
 Актуализирует список моделей для WordStat-парсера из каталога ТрансТехСервис (tts.ru).
 Запуск: раз в 2 недели (GitHub Actions) или вручную.
 
-ПОЧЕМУ ТТС, А НЕ MAJOR (решение сессии 31.05.2026):
-  Major-auto банит IP после ~9 запросов к /models/ (HTTP 429/403), окно бана длинное
-  (>10 мин), пауза не помогает. ТТС держит 14+ запросов подряд без бана (проверено).
-  Структура ТТС чище: модели нормализованы (нет NOVIY/GWM/обрезков), как у Major.
+ПОЧЕМУ ТТС, А НЕ MAJOR (решение 31.05.2026):
+  Major-auto банит IP после ~9 запросов (429/403). ТТС держит 14+ подряд. Структура чище.
 
 ЛОГИКА:
   1. По каждому бренду из BRANDS идём на tts.ru/auto/<slug>/
-  2. Из HTML достаём модели — ссылки вида /auto/<slug>/<model_slug>/
-  3. Извлечение модели ГИБКОЕ (слаги ТТС непостоянны):
-       'jetour-dashing' -> отрезаем префикс бренда -> 'dashing'
-       's50'            -> префикса нет -> 's50'
-       'x50plus'        -> 'x50plus'
-  4. Нормализуем (collapse_model): сворачиваем маркетинговые токены С ГОЛОВЫ и С ХВОСТА:
-       NOVIY/NEW/GWM/PLUS/PRO/FL/MAX/+/годы. НЕ трогаем значащие части.
-       Проверено на Belgee: s50->S50, x50plus->X50, x70-fl->X70.
+  2. Из HTML достаём модели — ссылки /auto/<slug>/<model_slug>/
+  3. Извлечение гибкое: 'jetour-dashing'->'dashing'; 's50'->'s50'; 'x50plus'->'x50plus'
+  4. Нормализуем (collapse_model): сворачиваем маркетинг-токены с головы и хвоста.
   5. keyword (латиница) = "<brand> <base_model>".
   6. Кириллица (решение 10 + автоген 05.07.2026):
-       - НОВАЯ модель: если модельная часть содержит цифру (H6, T4L, EX5) — генерим
-         keyword_cyr автоматически = "<бренд-кир> <модель как есть латиницей>",
-         где бренд-кир берётся из существующей active-строки этого бренда.
-         keyword_cyr_source="auto".
-       - Если модельная часть — слово без цифр (Coolray, Dashing) ИЛИ бренд-кириллицы
-         ещё нет нигде: keyword_cyr=NULL, keyword_cyr_source="manual", флаг в журнал.
+       - НОВАЯ модель, модельная часть С ЦИФРОЙ (H6, T4L, EX5) -> keyword_cyr авто =
+         "<бренд-кир из существующих строк> <модель латиницей как есть>", source='auto'.
+       - Модель-слово без цифр (Coolray) ИЛИ нет бренд-кириллицы -> NULL + флаг, source='manual'.
        - Платный LLM НЕ используется.
-  7. ГЛОБАЛЬНЫЙ ДЕДУП перед записью: если два слага свернулись в один (brand, model_name) —
-     оставляем один. Иначе HTTP 409 duplicate key (баг прошлой сессии на Belgee S50).
-  8. UPSERT в wordstat_models. ВСЕ объекты имеют ОДИНАКОВЫЙ набор ключей (иначе PGRST102).
-     Существующую кириллицу НЕ затираем.
-  9. Модель, пропавшую из каталога, помечаем active=false (не удаляем).
- 10. Бренд дал 0 моделей -> флаг в журнал (не падаем). Так Jeland (пока нет на ТТС)
-     корректно пропускается и подхватится сам, когда появится.
+  7. Глобальный дедуп перед записью (защита от 409).
+  8. UPSERT: ВСЕ объекты с ОДИНАКОВЫМ набором ключей (иначе PGRST102). Кириллицу не затираем.
+  9. МЯГКАЯ ДЕАКТИВАЦИЯ (решение 05.08.2026):
+       - модель НАЙДЕНА в каталоге -> miss_count=0, active=true (авто-возврат после сбоев).
+       - модель НЕ найдена -> miss_count+=1; active=false ТОЛЬКО если miss_count>=4.
+       Защита от ложного выключения рабочей модели при разовом сбое выдачи ТТС
+       (случай Tank 400, Jetour Dashing — выключались после 1 промаха).
+ 10. Бренд дал 0 моделей -> ВСЕ его модели считаем "не найденными" этот прогон
+       (miss_count+=1), но это тоже под порогом 4. Флаг в журнал.
 
-JELAND: правопреемник Jaecoo. Пока отсутствует на ТТС. Оставлен в BRANDS со слагом
-  'jeland' — при 0 моделей просто пишется в журнал, код не трогать, подхватится автоматом.
-
-ENV / GitHub Secrets:
-  SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
-
-ЗАВИСИМОСТИ:
-  pip install requests beautifulsoup4
+ENV / GitHub Secrets: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+ЗАВИСИМОСТИ: pip install requests beautifulsoup4
 """
 
 import os
@@ -60,47 +46,24 @@ except ImportError:
     sys.exit(1)
 
 # ================================================================
-# CONFIG
-# ================================================================
+MISS_THRESHOLD = 4   # деактивируем модель после N промахов ПОДРЯД (решение 05.08.2026)
+
 TTS_BASE = "https://www.tts.ru/auto/"
 
-# Бренды: "наш бренд" -> слаг ТТС. Слаги-исключения подтверждены по HTML каталога ТТС.
-# Uni НЕ парсим (входит в Changan). Jeland — на вырост (пока нет на ТТС).
 BRANDS = {
-    "Belgee":    "belgee",
-    "Changan":   "changan",
-    "Geely":     "geely",
-    "Haval":     "haval",
-    "Haval Pro": "haval-pro",
-    "Jetour":    "jetour",
-    "GAC":       "gac",
-    "Hongqi":    "hongqi",
-    "KGM":       "kgm",
-    "Voyah":     "voyah",
-    "Deepal":    "deepal",
-    "Omoda":     "omoda",
-    "Jaecoo":    "jaecoo",
-    "Exeed":     "exeed",
-    "LADA":      "lada",
-    "Tank":      "tank",
-    "Tenet":     "tenet",
-    "Moskvich":  "moskvich",
-    "ROX":       "rox",
-    "Jeland":    "jeland",   # появится позже — пока 0 моделей, не падаем
+    "Belgee": "belgee", "Changan": "changan", "Geely": "geely", "Haval": "haval",
+    "Haval Pro": "haval-pro", "Jetour": "jetour", "GAC": "gac", "Hongqi": "hongqi",
+    "KGM": "kgm", "Voyah": "voyah", "Deepal": "deepal", "Omoda": "omoda",
+    "Jaecoo": "jaecoo", "Exeed": "exeed", "LADA": "lada", "Tank": "tank",
+    "Tenet": "tenet", "Moskvich": "moskvich", "ROX": "rox", "Jeland": "jeland",
 }
 
-# Маркетинговые токены, сворачиваемые к базовой модели (регистронезависимо).
-# Режутся и С ГОЛОВЫ, и С ХВОСТА имени.
 COLLAPSE_TOKENS = {
     "plus", "pro", "fl", "new", "max", "mca",
-    "noviy", "novyy", "новый", "новая", "новое",
-    "gwm",
+    "noviy", "novyy", "новый", "новая", "новое", "gwm",
 }
-# Бренд-слова, прилипающие к имени (ТТС: 'h5-hongqi' -> H5). Срезаем с головы и хвоста.
 BRAND_WORDS = {"hongqi", "gwm"}
-# Полные слова-суффиксы, которые могут быть слитно с предыдущим токеном (x50plus -> x50, cs95new -> cs95).
 COLLAPSE_GLUED = ["plus", "pro", "fl", "max", "new"]
-# Год (2020–2099) — отдельный токен, сворачиваем.
 YEAR_RE = re.compile(r"^20\d{2}$")
 
 SB_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
@@ -111,9 +74,8 @@ HEADERS_BROWSER = {
                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
     "Accept-Language": "ru-RU,ru;q=0.9",
 }
-
-PAUSE_BETWEEN_BRANDS = 2.0   # ТТС бана нет, но вежливость не повредит
-RETRY_BACKOFF = [5, 15]      # на всякий — лёгкий ретрай при сетевом сбое/429
+PAUSE_BETWEEN_BRANDS = 2.0
+RETRY_BACKOFF = [5, 15]
 
 
 # ─── SUPABASE ───────────────────────────────────────────────────────────────
@@ -125,9 +87,9 @@ def sb_req(method, path, **kwargs):
 
 
 def load_existing():
-    """Текущие модели: {(brand, model_name): {keyword, keyword_cyr, active}}."""
+    """{(brand, model_name): {keyword, keyword_cyr, active, miss_count}}."""
     r = sb_req("GET", "/rest/v1/wordstat_models"
-                      "?select=brand,model_name,keyword,keyword_cyr,active")
+                      "?select=brand,model_name,keyword,keyword_cyr,active,miss_count")
     r.raise_for_status()
     out = {}
     for row in r.json():
@@ -135,26 +97,20 @@ def load_existing():
     return out
 
 
-def _full_row(brand, model_name, keyword, keyword_cyr, keyword_cyr_source, now_iso):
+def _full_row(brand, model_name, keyword, keyword_cyr, keyword_cyr_source,
+              active, miss_count, now_iso):
     """Единый набор ключей для ВСЕХ объектов upsert (иначе PGRST102)."""
     return {
-        "brand": brand,
-        "model_name": model_name,
-        "keyword": keyword,
-        "keyword_cyr": keyword_cyr,
-        "keyword_cyr_source": keyword_cyr_source,
-        "active": True,
-        "source": "tts",
-        "updated_at": now_iso,
+        "brand": brand, "model_name": model_name, "keyword": keyword,
+        "keyword_cyr": keyword_cyr, "keyword_cyr_source": keyword_cyr_source,
+        "active": active, "miss_count": miss_count,
+        "source": "tts", "updated_at": now_iso,
     }
 
 
 def upsert_models(rows):
     if not rows:
         return 0, None
-    # on_conflict ОБЯЗАТЕЛЕН: без него resolution=merge-duplicates не знает, по какому
-    # уникальному индексу мёржить, и запрос падает на дубле (HTTP 409). Индекс —
-    # wordstat_models_brand_model_name_key = UNIQUE(brand, model_name).
     r = sb_req("POST", "/rest/v1/wordstat_models?on_conflict=brand,model_name", json=rows,
                headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
     if r.status_code in (200, 201, 204):
@@ -162,19 +118,8 @@ def upsert_models(rows):
     return 0, f"HTTP {r.status_code}: {r.text[:300]}"
 
 
-def deactivate(brand, model_name):
-    sb_req("PATCH",
-           f"/rest/v1/wordstat_models?brand=eq.{brand}&model_name=eq.{model_name}",
-           json={"active": False, "updated_at": datetime.now(timezone.utc).isoformat()},
-           headers={"Prefer": "return=minimal"})
-
-
 # ─── ПАРС ТТС ─────────────────────────────────────────────────────────────────
 def fetch_brand_models(brand_slug):
-    """
-    Возвращает (set{model_slug}, err) для бренда с tts.ru/auto/<slug>/.
-    Лёгкий ретрай при сетевом сбое / 429.
-    """
     url = TTS_BASE + brand_slug + "/"
     attempts = len(RETRY_BACKOFF) + 1
     for i in range(attempts):
@@ -182,31 +127,21 @@ def fetch_brand_models(brand_slug):
             resp = requests.get(url, headers=HEADERS_BROWSER, timeout=40)
         except Exception as e:
             if i < attempts - 1:
-                time.sleep(RETRY_BACKOFF[i])
-                continue
+                time.sleep(RETRY_BACKOFF[i]); continue
             return None, f"запрос упал: {type(e).__name__}: {e}"
-
         if resp.status_code == 200:
             return _parse_models_html(resp.text, brand_slug), None
         if resp.status_code == 429 and i < attempts - 1:
-            time.sleep(RETRY_BACKOFF[i])
-            continue
+            time.sleep(RETRY_BACKOFF[i]); continue
         return None, f"HTTP {resp.status_code}"
     return None, "не удалось после ретраев"
 
 
 def _parse_models_html(html, brand_slug):
-    """
-    Ищем ссылки-модели /auto/<brand_slug>/<model_slug>/.
-    Исключаем служебные хвосты (detail.php, пагинацию, query).
-    """
-    pattern = re.compile(
-        rf"/auto/{re.escape(brand_slug)}/([^/\"?]+)/", re.IGNORECASE
-    )
+    pattern = re.compile(rf"/auto/{re.escape(brand_slug)}/([^/\"?]+)/", re.IGNORECASE)
     found = set()
     for m in pattern.finditer(html):
         slug = m.group(1).lower()
-        # detail.php и подобное отсекаем (там точка/параметры — не пройдут [^/"?]+ с точкой? точка пройдёт)
         if "." in slug or slug in ("", brand_slug):
             continue
         found.add(slug)
@@ -214,80 +149,40 @@ def _parse_models_html(html, brand_slug):
 
 
 def strip_brand_prefix(model_slug, brand_slug):
-    """
-    Гибкое извлечение: 'jetour-dashing' -> 'dashing'; 's50' -> 's50'.
-    Отрезаем префикс бренда ТОЛЬКО если он есть (слаги ТТС непостоянны).
-    """
     prefix = brand_slug.lower() + "-"
-    if model_slug.startswith(prefix):
-        return model_slug[len(prefix):]
-    return model_slug
+    return model_slug[len(prefix):] if model_slug.startswith(prefix) else model_slug
 
 
 def collapse_model(model_slug, brand, brand_slug):
-    """
-    Нормализует модель: отрезает префикс/суффикс бренда, маркетинговые токены, поколения,
-    хвостовые числа-исполнения.
-      'jetour-dashing'  -> 'DASHING'
-      's50'             -> 'S50'
-      'x50plus'         -> 'X50'        (plus/max сворачиваем всегда; поколения не различаем)
-      'cs35plus-mca'    -> 'CS35'       (plus + mca срезаны)
-      'cs95new'         -> 'CS95'
-      'h5-hongqi'       -> 'H5'         (бренд-слово в хвосте)
-      'novyy-atlas'     -> 'ATLAS'
-      'dargo-x'         -> 'DARGO'      (модификация)
-      'gs8-ii'          -> 'GS8'        (поколение)
-      'uni-s-4-4'       -> 'UNI S'      (исполнение 2WD/4WD — хвостовые числа при >=2 токенах)
-    НЕ трогает значащие имена: 'e-hs9' -> 'E HS9', 'emgrand-gs' -> 'EMGRAND GS',
-    'uni-k' -> 'UNI K', '300' (Tank) -> '300' (одиночное число не режем).
-    """
     raw = strip_brand_prefix(model_slug.lower(), brand_slug)
-    base = raw.replace("-", "_")
-    tokens = [t for t in base.split("_") if t]
+    tokens = [t for t in raw.replace("-", "_").split("_") if t]
 
-    # маркер «срезаемый хвост»: маркетинг-токен / год / бренд-слово / римское поколение / одиночная буква-модификация
-    def droppable_tail(tok, ntokens):
-        if tok in COLLAPSE_TOKENS or tok in BRAND_WORDS:
-            return True
-        if YEAR_RE.match(tok):
-            return True
-        if tok in ("ii", "iii", "iv"):          # поколения: GS8 II -> GS8
-            return True
-        # хвостовое число-исполнение (UNI S 4 4) — только если в имени уже >=2 значащих токена
-        if tok.isdigit() and ntokens > 2:
-            return True
+    def droppable_tail(tok, n):
+        if tok in COLLAPSE_TOKENS or tok in BRAND_WORDS: return True
+        if YEAR_RE.match(tok): return True
+        if tok in ("ii", "iii", "iv"): return True
+        if tok.isdigit() and n > 2: return True
         return False
 
     def droppable_head(tok):
         return tok in COLLAPSE_TOKENS or tok in BRAND_WORDS or bool(YEAR_RE.match(tok))
 
-    # 1) С ГОЛОВЫ
     while len(tokens) > 1 and droppable_head(tokens[0]):
         tokens.pop(0)
-    # 2) С ХВОСТА
     while len(tokens) > 1 and droppable_tail(tokens[-1], len(tokens)):
         tokens.pop()
-    # 3) суффикс слитно: x50plus -> x50, cs95new -> cs95
     if tokens:
         last = tokens[-1]
         for suf in COLLAPSE_GLUED:
             if last.endswith(suf) and len(last) > len(suf):
-                tokens[-1] = last[:-len(suf)]
-                break
+                tokens[-1] = last[:-len(suf)]; break
 
-    base_model = " ".join(tokens).strip() or base
-    keyword_lat = f"{brand.lower()} {base_model}".strip()
-    model_name = base_model.upper()
-    return model_name, keyword_lat
+    base_model = " ".join(tokens).strip() or raw.replace("-", " ")
+    return base_model.upper(), f"{brand.lower()} {base_model}".strip()
 
 
-# ─── АВТОГЕНЕРАЦИЯ КИРИЛЛИЦЫ (05.07.2026) ────────────────────────────────────
+# ─── АВТОКИРИЛЛИЦА ───────────────────────────────────────────────────────────
 def build_brand_cyr_map(existing):
-    """
-    Собирает {brand: "<бренд-кириллица>"} из существующих строк с заполненным keyword_cyr.
-    Бренд-кириллица = первое слово keyword_cyr (напр. "джили монжаро" -> "джили").
-    Берём наиболее частое первое слово по бренду (защита от опечаток в отдельных строках).
-    """
     from collections import Counter, defaultdict
     per_brand = defaultdict(Counter)
     for (brand, _), row in existing.items():
@@ -300,18 +195,9 @@ def build_brand_cyr_map(existing):
 
 
 def auto_cyrillic(brand, model_name, brand_cyr_map):
-    """
-    Пытается сгенерировать keyword_cyr для НОВОЙ модели.
-    Правило (подтверждено пользователем 05.07.2026):
-      - модельная часть содержит цифру (H6, T4L, EX5) -> keyword_cyr = "<бренд-кир> <модель латиницей как есть>"
-      - модельная часть без цифр (слово: Coolray) ИЛИ нет бренд-кириллицы -> None (ручное заполнение)
-    Возвращает (keyword_cyr | None, source: 'auto'|'manual').
-    """
     brand_cyr = brand_cyr_map.get(brand)
-    has_digit = bool(re.search(r"\d", model_name))
-    if brand_cyr and has_digit:
-        model_part = model_name.lower().strip()
-        return f"{brand_cyr} {model_part}", "auto"
+    if brand_cyr and re.search(r"\d", model_name):
+        return f"{brand_cyr} {model_name.lower().strip()}", "auto"
     return None, "manual"
 
 
@@ -322,26 +208,25 @@ def main():
         sys.exit(1)
 
     existing = load_existing()
-    brand_cyr_map = build_brand_cyr_map(existing)   # бренд -> кириллица (из существующих строк)
-    seen_now = set()
-    # глобальный дедуп: (brand, model_name) -> row. Защита от HTTP 409.
+    brand_cyr_map = build_brand_cyr_map(existing)
     rows_by_key = {}
     warnings = []
+    seen_now = set()
+    deactivated = []
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    print(f"=== ТТС-sync | брендов: {len(BRANDS)} | бренд-кириллиц известно: {len(brand_cyr_map)} ===\n")
+    print(f"=== ТТС-sync | брендов: {len(BRANDS)} | бренд-кириллиц: {len(brand_cyr_map)} "
+          f"| порог деактивации: {MISS_THRESHOLD} ===\n")
 
     for brand, slug in BRANDS.items():
         print(f"[{brand}] {TTS_BASE}{slug}/ ...", flush=True)
         model_slugs, err = fetch_brand_models(slug)
         if err or not model_slugs:
-            msg = f"{brand}: 0 моделей ({err or 'пусто'}) — проверь слаг"
-            print("   ⚠", msg)
-            warnings.append(msg)
+            warnings.append(f"{brand}: 0 моделей ({err or 'пусто'}) — модели этого бренда +1 промах")
+            print("   ⚠ 0 моделей —", err or "пусто")
             time.sleep(PAUSE_BETWEEN_BRANDS)
-            continue
+            continue  # модели этого бренда обработаются как "не найденные" ниже
 
-        # сворачиваем; дубли по model_name схлопываются прямо здесь
         collapsed = {}
         for ms in model_slugs:
             model_name, kw_lat = collapse_model(ms, brand, slug)
@@ -353,32 +238,45 @@ def main():
             seen_now.add(key)
             if key in existing:
                 prev_cyr = existing[key].get("keyword_cyr")
-                # существующую кириллицу НЕ трогаем; source оставляем manual (не знаем исходный)
-                rows_by_key[key] = _full_row(brand, model_name, kw_lat, prev_cyr, "manual", now_iso)
+                # НАЙДЕНА -> сброс промахов, активна
+                rows_by_key[key] = _full_row(brand, model_name, kw_lat, prev_cyr,
+                                             "manual", True, 0, now_iso)
             else:
                 cyr, src = auto_cyrillic(brand, model_name, brand_cyr_map)
                 if cyr:
                     print(f"   + новая: {model_name} -> кириллица авто: '{cyr}'")
                 else:
-                    warnings.append(f"{brand} {model_name}: новая, keyword_cyr=NULL — вписать вручную (модель-слово или нет бренд-кириллицы)")
-                rows_by_key[key] = _full_row(brand, model_name, kw_lat, cyr, src, now_iso)
+                    warnings.append(f"{brand} {model_name}: новая, keyword_cyr=NULL — вписать вручную")
+                rows_by_key[key] = _full_row(brand, model_name, kw_lat, cyr, src,
+                                             True, 0, now_iso)
         time.sleep(PAUSE_BETWEEN_BRANDS)
 
-    # глобально дедуплицированный список (баг 409 закрыт)
-    upsert_rows = list(rows_by_key.values())
-
-    # модели, пропавшие из каталога -> деактивируем
+    # МЯГКАЯ ДЕАКТИВАЦИЯ: модели в БД, которых НЕ увидели в этом прогоне
     for (brand, model_name), row in existing.items():
-        if row.get("active") and (brand, model_name) not in seen_now and brand in BRANDS:
-            print(f"   - пропала из каталога: {brand} {model_name} -> active=false")
-            deactivate(brand, model_name)
+        if brand not in BRANDS:
+            continue
+        if (brand, model_name) in seen_now:
+            continue  # найдена — уже обработана выше
+        # НЕ найдена в этом прогоне -> +1 промах
+        new_miss = int(row.get("miss_count") or 0) + 1
+        still_active = new_miss < MISS_THRESHOLD
+        if not still_active:
+            deactivated.append(f"{brand} {model_name} (miss={new_miss})")
+        rows_by_key[(brand, model_name)] = _full_row(
+            brand, model_name, row.get("keyword"), row.get("keyword_cyr"),
+            "manual", still_active, new_miss, now_iso)
 
+    upsert_rows = list(rows_by_key.values())
     inserted, err = upsert_models(upsert_rows)
     if err:
         print(f"\n⚠ Ошибка записи: {err}")
         sys.exit(1)
 
     print(f"\n✓ Готово: обновлено {inserted} моделей.")
+    if deactivated:
+        print(f"⛔ Деактивировано (>= {MISS_THRESHOLD} промахов подряд): {len(deactivated)}")
+        for d in deactivated:
+            print("   -", d)
     if warnings:
         print(f"⚠ Предупреждений: {len(warnings)}")
         for w in warnings:
