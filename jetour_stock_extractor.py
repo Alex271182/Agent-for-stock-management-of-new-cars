@@ -2,7 +2,7 @@
 JETOUR RF Stock Extractor  (v4)
 ================================
 Запуск:  python jetour_stock_extractor.py
-
+ 
 Что делает:
 1. Собирает ВСЕ автомобили Jetour по всей РФ через API TradeDealer.
 2. Сохраняет CSV с расширенным набором полей (для подстраховки/Excel).
@@ -10,24 +10,24 @@ JETOUR RF Stock Extractor  (v4)
    дополнительно заливает срез в stock_staging и вызывает серверную функцию
    apply_stock_snapshot (мёрж в stock_cars: приход/обновление/выбытие) и логирует
    запуск в parsing_runs. Если .env нет — работает как раньше (CSV-only).
-
+ 
 Изменения v4:
 - Добавлена опциональная загрузка в Supabase (без слома существующего CSV).
 - Журнал запусков в parsing_runs (для контроля свежести данных 2-м агентом).
 - UPSERT-стратегия: один и тот же запуск дважды за день не задвоит записи.
-
+ 
 Изменения v3:
 - Retry-логика на сетевые сбои (RemoteDisconnected, 5xx, 429).
 - Увеличена пауза между запросами с 0.3 до 0.5 сек.
-
+ 
 Изменения v2:
 - Токены _token и _tokenProduct захардкожены в CONFIG.
 - Fallback: попытка выудить _tokenProduct из HTML (на случай смены).
-
+ 
 Зависимости:  requests, python-dotenv
 Установка:    pip install requests python-dotenv
 """
-
+ 
 import csv
 import json
 import os
@@ -37,23 +37,23 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-
+ 
 import requests
-
+ 
 # python-dotenv опционален: без него CSV работает, Supabase — нет
 try:
     from dotenv import load_dotenv
     load_dotenv()  # подгружает .env из текущей папки
 except ImportError:
     pass
-
-
+ 
+ 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 CONFIG = {
     # Базовые URL
     "site_url":   "https://jetour-ru.com/cars",
     "api_url":    "https://locator-backend.tradedealer.ru/filter",
-
+ 
     # ТОКЕНЫ платформы TradeDealer (постоянные для проекта Jetour).
     # Получены из реального запроса браузера 16.05.2026.
     # Если перестанут работать — обнови, открыв сайт jetour-ru.com/cars, DevTools→
@@ -61,25 +61,25 @@ CONFIG = {
     # из URL.
     "token":          "zkxRRQVkoqalQeOL",
     "token_product":  "F1kJOEWOdv0Efwpr",
-
+ 
     # Параметры запроса к API
     "brand":      "jetour",
     "car_type":   "new",
     "page_limit": 24,
     "order":      "photo",
     "gens":       1,
-
+ 
     # Сеть
     "delay_sec":     0.5,    # Базовая пауза между успешными запросами
     "timeout":       30,
     "max_pages":     500,    # 3427/24 ≈ 143 страницы, 500 — с большим запасом
     "max_retries":   5,      # Сколько раз перезапросить страницу при сетевой ошибке
     "retry_backoff": 2.0,    # Множитель экспоненциальной паузы (2 → 4 → 8 → 16 → 32 сек)
-
+ 
     # Куда сохранять
     "output_dir": ".",
 }
-
+ 
 # Заголовки запросов (под обычный Chrome, с Referer/Origin как у реального браузера)
 HEADERS = {
     "User-Agent": (
@@ -91,21 +91,21 @@ HEADERS = {
     "Referer": "https://jetour-ru.com/",
     "Origin":  "https://jetour-ru.com",
 }
-
-
+ 
+ 
 # ─── ПОДГОТОВКА СЕССИИ (опционально — посетить /cars для куки) ───────────────
 def warmup_session(session):
     """Получает HTML страницы /cars, чтобы:
     1. Заполнить session.cookies (некоторые WAF/CDN могут проверять).
     2. Попытаться выудить актуальный _tokenProduct (на случай его смены в будущем).
-
+ 
     Возвращает обновлённый словарь токенов.
     """
     tokens = {
         "_token":        CONFIG["token"],
         "_tokenProduct": CONFIG["token_product"],
     }
-
+ 
     print("[1/3] Прогрев сессии: открываю {} ...".format(CONFIG["site_url"]))
     try:
         r = session.get(CONFIG["site_url"], headers=HEADERS, timeout=CONFIG["timeout"])
@@ -115,7 +115,7 @@ def warmup_session(session):
         print("   ⚠ Не удалось получить страницу /cars: {}: {}".format(type(e).__name__, e))
         print("   ⚠ Продолжаю с захардкоженными токенами из CONFIG.")
         return tokens
-
+ 
     # Пытаемся обновить _tokenProduct (он стабильно лежит в HTML, см. анализ).
     m = re.search(r"tokenProduct\s*=\s*['\"]([A-Za-z0-9_-]+)['\"]", html)
     if m:
@@ -129,19 +129,19 @@ def warmup_session(session):
     else:
         print("   ⚠ _tokenProduct в HTML не найден; использую CONFIG: {}"
               .format(tokens["_tokenProduct"]))
-
+ 
     print("   ✓ _token из CONFIG: {}".format(tokens["_token"]))
     print("   ✓ Cookie получены, сессия готова.")
     return tokens
-
-
+ 
+ 
 # ─── ОСНОВНОЙ ЗАПРОС К API ───────────────────────────────────────────────────
 # Какие ошибки считаем "транзиентными" — стоит ли их повторять.
 # RemoteDisconnected, ConnectionError, Timeout — типичные сбои rate-limit/сети.
 # HTTP 429/500/502/503/504 — на стороне сервера, тоже имеет смысл повторить.
 TRANSIENT_HTTP_CODES = {429, 500, 502, 503, 504}
-
-
+ 
+ 
 def _fetch_page_once(session, page, tokens):
     """Один запрос страницы, без retry."""
     params = {
@@ -160,11 +160,11 @@ def _fetch_page_once(session, page, tokens):
                     timeout=CONFIG["timeout"])
     r.raise_for_status()
     return r.json()
-
-
+ 
+ 
 def fetch_page(session, page, tokens):
     """Запрашивает страницу с автоматическими повторами при транзиентных ошибках.
-
+ 
     Возвращает (data, None) при успехе и (None, last_exception) при провале
     всех попыток. Не транзиентные ошибки (например, 401) пробрасываются сразу.
     """
@@ -172,7 +172,7 @@ def fetch_page(session, page, tokens):
     for attempt in range(1, CONFIG["max_retries"] + 1):
         try:
             return _fetch_page_once(session, page, tokens), None
-
+ 
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else None
             if status not in TRANSIENT_HTTP_CODES:
@@ -181,28 +181,28 @@ def fetch_page(session, page, tokens):
             last_exc = e
             print("      попытка {}/{} → HTTP {} → жду и повторяю".format(
                 attempt, CONFIG["max_retries"], status))
-
+ 
         except (requests.ConnectionError, requests.Timeout) as e:
             last_exc = e
             print("      попытка {}/{} → {} → жду и повторяю".format(
                 attempt, CONFIG["max_retries"], type(e).__name__))
-
+ 
         # Экспоненциальная пауза: 2, 4, 8, 16, 32 сек
         if attempt < CONFIG["max_retries"]:
             backoff = CONFIG["retry_backoff"] ** attempt
             time.sleep(backoff)
-
+ 
     return None, last_exc
-
-
+ 
+ 
 def fetch_all_cars(session, tokens):
     """Постранично собирает все автомобили."""
     all_cars = []
     page = 1
     debug_saved = False
-
+ 
     print("[2/3] Загружаю каталог постранично (limit={}/стр) ...".format(CONFIG["page_limit"]))
-
+ 
     while page <= CONFIG["max_pages"]:
         try:
             data, retry_exc = fetch_page(session, page, tokens)
@@ -225,67 +225,67 @@ def fetch_all_cars(session, tokens):
             print("   ✗ Ошибка на странице {}: {}: {}".format(
                 page, type(e).__name__, e))
             break
-
+ 
         if data is None:
             # Все retry исчерпаны на транзиентной ошибке
             print("   ✗ Страница {} не получена после {} попыток: {}".format(
                 page, CONFIG["max_retries"], retry_exc))
             print("   ⚠ Сохраняю то, что успели скачать.")
             break
-
+ 
         items = data.get("list", [])
         total = data.get("total", 0)
         can_more = data.get("canShowMore", False)
-
+ 
         if not items:
             if page == 1:
                 print("   ✗ API вернул пустой список. Ответ: {}".format(
                     json.dumps(data, ensure_ascii=False)[:500]))
             break
-
+ 
         all_cars.extend(items)
         print("   стр {:3d}: получено {:3d} а/м, всего {:4d}/{}".format(
             page, len(items), len(all_cars), total))
-
+ 
         if not can_more:
             break
-
+ 
         page += 1
         time.sleep(CONFIG["delay_sec"])
-
+ 
     return all_cars
-
-
+ 
+ 
 # ─── ФОРМИРОВАНИЕ CSV ────────────────────────────────────────────────────────
 CSV_HEADER = [
     # Идентификация
     "ID", "VIN", "VIN полный", "Год",
     "Дата производства", "Дата публикации", "Дата обновления", "Статус",
-
+ 
     # Модель / комплектация
     "Модель", "Модель alias", "Поколение", "Комплектация", "Mcode комплектации",
     "Объём л", "Мощность лс", "КПП тип", "КПП название", "Привод", "Кузов",
-
+ 
     # Цвет
     "Цвет", "Базовый цвет код", "Доплата за цвет",
-
+ 
     # Цены / скидки
     "Цена базовая", "Цена спец", "Цена с ТИ",
     "Скидка ТИ", "Скидка кредит", "Скидка комплектация", "Скидка цвет",
     "Скидка доп. оборудование", "Скидка страхование", "Скидка рассрочка",
     "Скидка лизинг", "Максимальная скидка",
-
+ 
     # Дилер
     "Дилер ID", "Дилер название", "Дилер alias", "Дилер адрес",
     "Дилер город", "Дилер город alias", "Дилер lon", "Дилер lat",
     "Дилер OEM ID", "Дилер телефон",
-
+ 
     # Прочее
     "Параллельный импорт", "Пробег", "Б/У",
     "Фото реальных", "Фото каталог", "Доп. оборудование шт",
 ]
-
-
+ 
+ 
 def get_nested(obj, *keys, default=""):
     """Безопасное извлечение вложенного поля."""
     cur = obj
@@ -296,21 +296,21 @@ def get_nested(obj, *keys, default=""):
         if cur is None:
             return default
     return cur if cur is not None else default
-
-
+ 
+ 
 def car_to_row(car):
     """Преобразует один объект машины из JSON в строку CSV."""
     company = car.get("company") or {}
     city = company.get("city") or {}
     location = company.get("location") or {}
     phone_list = company.get("phoneList") or {}
-
+ 
     main_phone = ""
     if isinstance(phone_list, dict):
         main = phone_list.get("main") or phone_list.get("newCars") or []
         if isinstance(main, list) and main:
             main_phone = main[0]
-
+ 
     color = car.get("color") or {}
     base_color = car.get("baseColor") or {}
     complect = car.get("complectation") or {}
@@ -318,13 +318,13 @@ def car_to_row(car):
     transmission = modif.get("transmission") or {}
     model = car.get("model") or {}
     generation = car.get("generation") or {}
-
+ 
     return [
         # Идентификация
         car.get("id", ""), car.get("vin", ""), car.get("vin_full", ""),
         car.get("year", ""), car.get("prodDate", ""), car.get("publishedAt", ""),
         car.get("updatedAt", ""), car.get("status", ""),
-
+ 
         # Модель
         model.get("titleRus", ""), model.get("alias", ""),
         generation.get("titleRus", ""),
@@ -334,12 +334,12 @@ def car_to_row(car):
         transmission.get("type", ""), transmission.get("title", ""),
         modif.get("wheel", "") or modif.get("drive", ""),
         modif.get("body", "") or get_nested(car, "body", "title"),
-
+ 
         # Цвет
         color.get("titleRus", "") or color.get("title", ""),
         base_color.get("code", ""),
         car.get("colorPrice", 0),
-
+ 
         # Цены / скидки
         car.get("price", ""), car.get("specialPrice", ""),
         get_nested(car, "specials", "tradein", default=""),
@@ -348,7 +348,7 @@ def car_to_row(car):
         car.get("addingDiscount", 0), car.get("insuranceDiscount", 0),
         car.get("installmentDiscount", 0), car.get("leasingDiscount", 0),
         car.get("maxDiscounts", 0),
-
+ 
         # Дилер
         company.get("id", ""), company.get("commerceTitle", ""),
         company.get("alias", ""), company.get("address", ""),
@@ -356,33 +356,33 @@ def car_to_row(car):
         city.get("alias", ""),
         location.get("lon", ""), location.get("lat", ""),
         company.get("oemDealerId", ""), main_phone,
-
+ 
         # Прочее
         car.get("parallelImport", False), car.get("run", 0), car.get("used", False),
         car.get("realPhotosCount", 0), car.get("catalogPhotosCount", 0),
         car.get("addEquipmentCount", 0),
     ]
-
-
+ 
+ 
 def save_csv(cars):
     """Сохраняет CSV в формате для русского Excel (UTF-8 BOM, разделитель ';')."""
     today = datetime.now().strftime("%Y-%m-%d")
     out_path = Path(CONFIG["output_dir"]) / "jetour_rf_stock_{}.csv".format(today)
-
+ 
     with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f, delimiter=";", quoting=csv.QUOTE_MINIMAL)
         w.writerow(CSV_HEADER)
         for car in cars:
             w.writerow(car_to_row(car))
-
+ 
     return out_path
-
-
+ 
+ 
 # ─── СТАТИСТИКА ──────────────────────────────────────────────────────────────
 def print_stats(cars):
     print("[3/3] Сводка по выгрузке:")
     print("   Всего а/м: {}".format(len(cars)))
-
+ 
     by_model, by_city, by_status = {}, {}, {}
     for c in cars:
         m = get_nested(c, "model", "titleRus") or "?"
@@ -391,36 +391,36 @@ def print_stats(cars):
         by_model[m] = by_model.get(m, 0) + 1
         by_city[city] = by_city.get(city, 0) + 1
         by_status[status] = by_status.get(status, 0) + 1
-
+ 
     print("\n   По моделям:")
     for m, n in sorted(by_model.items(), key=lambda x: -x[1]):
         print("      {:20s} {:5d}".format(m, n))
-
+ 
     print("\n   По статусам:")
     for s, n in sorted(by_status.items(), key=lambda x: -x[1]):
         print("      {:20s} {:5d}".format(s, n))
-
+ 
     print("\n   Топ-10 городов:")
     for city, n in sorted(by_city.items(), key=lambda x: -x[1])[:10]:
         print("      {:25s} {:5d}".format(city, n))
-
-
+ 
+ 
 # ─── ЗАГРУЗКА В SUPABASE (опционально) ──────────────────────────────────────
 # Брендовое имя для записи в stock_cars.brand / stock_staging.brand
 BRAND_KEY = "jetour"
-
-
-
-
+ 
+ 
+ 
+ 
 def _parse_compl_code(code):
     """Вытаскивает engine_volume, engine_power, drive_type из mcode TradeDealer.
-
+ 
     Формат кода: {model}-{комплект}-{volume}-{transmission}-{power}-{drive}
     Примеры:
         T2-Престиж-2.0-РКП-245-4WD    → vol=2.0, power=245, drive=4WD
         GS4-GL-2.0-AMT-231-4WD        → vol=2.0, power=231, drive=4WD
         Dashing-Комфорт-1.5-РКП-147-2WD → vol=1.5, power=147, drive=2WD
-
+ 
     Используется как фолбэк, если API не вернул поля напрямую.
     Возвращает (vol, power, drive) — каждый None, если не распознан.
     """
@@ -443,7 +443,7 @@ def _parse_compl_code(code):
         except ValueError:
             pass
     return vol, power, drive
-
+ 
 def car_to_supabase_row(car):
     """Преобразует JSON-объект машины в строку для stock_staging (без даты и raw_data).
     Дата среза проставляется при заливке в staging.
@@ -452,19 +452,20 @@ def car_to_supabase_row(car):
     city = company.get("city") or {}
     location = company.get("location") or {}
     phone_list = company.get("phoneList") or {}
-
+ 
     main_phone = ""
     if isinstance(phone_list, dict):
         main = phone_list.get("main") or phone_list.get("newCars") or []
         if isinstance(main, list) and main:
             main_phone = main[0]
-
+ 
     color = car.get("color") or {}
+    interior_color = car.get("interiorColor") or car.get("colorInterior") or {}
     complect = car.get("complectation") or {}
     modif = car.get("modification") or {}
     transmission = modif.get("transmission") or {}
     model = car.get("model") or {}
-
+ 
     # Считаем days_on_stock сами (сегодня - published_at)
     published_at_str = car.get("publishedAt") or ""
     published_date = ""
@@ -478,10 +479,10 @@ def car_to_supabase_row(car):
         except (ValueError, TypeError):
             published_date = ""
             days_on_stock = None
-
+ 
     prod_date_str = car.get("prodDate") or ""
     prod_date = prod_date_str[:10] if prod_date_str else None
-
+ 
     def _int_or_none(v):
         if v is None or v == "":
             return None
@@ -489,7 +490,7 @@ def car_to_supabase_row(car):
             return int(v)
         except (ValueError, TypeError):
             return None
-
+ 
     def _num_or_none(v):
         if v is None or v == "":
             return None
@@ -497,11 +498,11 @@ def car_to_supabase_row(car):
             return float(v)
         except (ValueError, TypeError):
             return None
-
+ 
     return {
         "brand":              BRAND_KEY,
         "car_id":             str(car.get("id", "")),
-
+ 
         # VIN/базовые
         "vin":                car.get("vin") or None,
         "vin_full":           car.get("vin_full") or None,
@@ -510,7 +511,7 @@ def car_to_supabase_row(car):
         "published_at":       published_date or None,
         "days_on_stock":      days_on_stock,
         "status":             car.get("status") or None,
-
+ 
         # Модель / комплектация
         "model":              model.get("titleRus") or None,
         "model_alias":        model.get("alias") or None,
@@ -528,7 +529,8 @@ def car_to_supabase_row(car):
             complect.get("mcode") or ""),
         "body_type":          modif.get("body") or get_nested(car, "body", "title") or None,
         "color":              color.get("titleRus") or color.get("title") or None,
-
+        "color_interior":     interior_color.get("titleRus") or interior_color.get("title") or None,
+ 
         # Цены / скидки
         "price_base":         _int_or_none(car.get("price")),
         "price_special":      _int_or_none(car.get("specialPrice")),
@@ -539,7 +541,7 @@ def car_to_supabase_row(car):
         "discount_color":     _int_or_none(car.get("colorPrice")),
         "discount_insurance": _int_or_none(car.get("insuranceDiscount")),
         "discount_max":       _int_or_none(car.get("maxDiscounts")),
-
+ 
         # Дилер
         "dealer_id":          str(company.get("id", "")) or None,
         "dealer_name":        company.get("commerceTitle") or None,
@@ -549,14 +551,14 @@ def car_to_supabase_row(car):
         "dealer_lat":         _num_or_none(location.get("lat")),
         "dealer_lon":         _num_or_none(location.get("lon")),
         "dealer_phone":       main_phone or None,
-
+ 
         # Прочее
         "parallel_import":    bool(car.get("parallelImport", False)),
         "mileage_km":         _int_or_none(car.get("run")),
         "is_used":            bool(car.get("used", False)),
     }
-
-
+ 
+ 
 def supabase_request(method, url, key, **kwargs):
     """Обёртка для запросов к Supabase REST API с авторизацией."""
     headers = kwargs.pop("headers", {})
@@ -566,8 +568,8 @@ def supabase_request(method, url, key, **kwargs):
         "Content-Type":  "application/json",
     })
     return requests.request(method, url, headers=headers, timeout=60, **kwargs)
-
-
+ 
+ 
 def supabase_log_run_start(supabase_url, key):
     """Создаёт запись в parsing_runs со status='running'.
     Возвращает run_id или None при ошибке.
@@ -591,8 +593,8 @@ def supabase_log_run_start(supabase_url, key):
     except Exception as e:
         print("   ⚠ Ошибка создания parsing_runs: {}: {}".format(type(e).__name__, e))
         return None
-
-
+ 
+ 
 def supabase_log_run_finish(supabase_url, key, run_id, status,
                             rows_inserted, rows_total, duration_sec,
                             error_message=None):
@@ -619,25 +621,25 @@ def supabase_log_run_finish(supabase_url, key, run_id, status,
     except Exception as e:
         print("   ⚠ Ошибка обновления parsing_runs: {}: {}".format(
             type(e).__name__, e))
-
-
+ 
+ 
 def upload_to_supabase(cars, supabase_url, key, batch_size=200):
     """Загружает срез в stock_staging батчами, затем вызывает серверную функцию
     apply_stock_snapshot(brand, date), которая мёржит staging в stock_cars
     (приход/обновление/выбытие с защитами) и чистит staging.
-
+ 
     Возвращает (result_dict_or_None, error_message_or_None).
     result_dict — JSON-ответ функции (arrived/updated/removed/removal_done/note).
-
+ 
     batch_size=200: чтобы избежать statement_timeout Supabase на больших вставках.
     """
     snapshot_date = datetime.now().strftime("%Y-%m-%d")
     staging_url = supabase_url.rstrip("/") + "/rest/v1/stock_staging"
-
+ 
     rows = [car_to_supabase_row(c) for c in cars]
     for row in rows:
         row["snapshot_date"] = snapshot_date
-
+ 
     # Дедуп по (brand, car_id): API иногда отдаёт машину дважды на стыке страниц.
     seen = {}
     for row in rows:
@@ -646,10 +648,10 @@ def upload_to_supabase(cars, supabase_url, key, batch_size=200):
     if deduped:
         print("   ⚠ Дублей по car_id: {} (удалено)".format(deduped))
     rows = list(seen.values())
-
+ 
     total = len(rows)
     print("   [a] Заливаю {} строк в stock_staging батчами по {} ...".format(total, batch_size))
-
+ 
     # На всякий случай чистим staging этого бренда перед заливкой (если прошлый прогон упал)
     try:
         supabase_request(
@@ -657,7 +659,7 @@ def upload_to_supabase(cars, supabase_url, key, batch_size=200):
             headers={"Prefer": "return=minimal"})
     except Exception as e:
         print("   ⚠ Не удалось очистить staging заранее: {}: {}".format(type(e).__name__, e))
-
+ 
     staged = 0
     for i in range(0, total, batch_size):
         batch = rows[i:i + batch_size]
@@ -676,7 +678,7 @@ def upload_to_supabase(cars, supabase_url, key, batch_size=200):
             err = "{}: {}".format(type(e).__name__, e)
             print("      батч {:3d}-{:3d}: ERROR {}".format(i + 1, i + len(batch), err))
             return None, err
-
+ 
     # [b] Вызываем серверную функцию мёржа staging -> stock_cars
     print("   [b] Вызываю apply_stock_snapshot('{}', '{}') ...".format(BRAND_KEY, snapshot_date))
     rpc_url = supabase_url.rstrip("/") + "/rest/v1/rpc/apply_stock_snapshot"
@@ -691,39 +693,39 @@ def upload_to_supabase(cars, supabase_url, key, batch_size=200):
         return result, None
     except Exception as e:
         return None, "rpc {}: {}".format(type(e).__name__, e)
-
-
+ 
+ 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 def main():
     session = requests.Session()
     started = time.time()
-
+ 
     tokens = warmup_session(session)
-
+ 
     cars = fetch_all_cars(session, tokens)
     if not cars:
         print("✗ Не получено ни одного автомобиля. См. вывод выше.")
         return 1
-
+ 
     print_stats(cars)
-
+ 
     out_path = save_csv(cars)
     print("\n✓ CSV сохранён: {}".format(out_path.resolve()))
     print("  Для фильтрации по региону используй колонку 'Дилер город alias'")
     print("  Пример: sankt-peterburg, moskva, ekaterinburg")
-
+ 
     # Опциональная загрузка в Supabase
     supabase_url = os.environ.get("SUPABASE_URL")
     key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-
+ 
     if supabase_url and key:
         print("\n[4/4] Загрузка в Supabase ...")
         run_id = supabase_log_run_start(supabase_url, key)
-
+ 
         try:
             result, err = upload_to_supabase(cars, supabase_url, key)
             duration = int(time.time() - started)
-
+ 
             if err is None:
                 arrived = result.get("arrived", 0)
                 updated = result.get("updated", 0)
@@ -755,7 +757,7 @@ def main():
                     error_message=err,
                 )
                 print("\n⚠ Загрузка не удалась. Причина: {}".format(err))
-
+ 
         except Exception as e:
             duration = int(time.time() - started)
             supabase_log_run_finish(
@@ -771,9 +773,9 @@ def main():
     else:
         print("\nℹ Supabase не настроен (нет SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY в .env).")
         print("  Парсер отработал в режиме CSV-only.")
-
+ 
     return 0
-
-
+ 
+ 
 if __name__ == "__main__":
     sys.exit(main())
