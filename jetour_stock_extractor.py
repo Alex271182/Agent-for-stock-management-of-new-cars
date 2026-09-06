@@ -243,18 +243,6 @@ def fetch_all_cars(session, tokens):
                     json.dumps(data, ensure_ascii=False)[:500]))
             break
  
-        # DEBUG: ключи первой машины
-        if page == 1 and items:
-            import json as _json
-            car0 = items[0]
-            print("\n=== DEBUG: ключи объекта машины ===")
-            for k, v in sorted(car0.items()):
-                if isinstance(v, dict):
-                    print(f"  [{k}] (dict): {list(v.keys())}")
-                else:
-                    print(f"  {k}: {str(v)[:60]}")
-            print("===================================\n")
- 
         all_cars.extend(items)
         print("   стр {:3d}: получено {:3d} а/м, всего {:4d}/{}".format(
             page, len(items), len(all_cars), total))
@@ -472,7 +460,7 @@ def car_to_supabase_row(car):
             main_phone = main[0]
  
     color = car.get("color") or {}
-    interior_color = car.get("interiorColor") or car.get("colorInterior") or {}
+    interior_color = car.get("interior") or {}
     complect = car.get("complectation") or {}
     modif = car.get("modification") or {}
     transmission = modif.get("transmission") or {}
